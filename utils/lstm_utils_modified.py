@@ -193,18 +193,18 @@ class ModelUtils:
         return [_input, output, helpers]
 
     def init_hidden(self, batch_size: int,
-                    hidden_size: int) -> Tuple[Any, Any]:
+            hidden_size: int, num_layers: int) -> Tuple[Any, Any]:
         """Get initial hidden state for LSTM.
 
         Args:
             batch_size: Batch size
             hidden_size: Hidden size of LSTM
-
+            num_layers : Number of layers in each LSTM cell
         Returns:
             Initial hidden states
 
         """
         return (
-            torch.zeros(batch_size, hidden_size).to(device),
-            torch.zeros(batch_size, hidden_size).to(device),
+            torch.zeros(num_layers, batch_size, hidden_size).to(device),
+            torch.zeros(num_layers, batch_size, hidden_size).to(device),
         )

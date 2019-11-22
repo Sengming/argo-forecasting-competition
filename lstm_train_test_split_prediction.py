@@ -34,6 +34,7 @@ import utils.baseline_utils_modified as baseline_utils
 from utils.lstm_utils_modified import ModelUtils, LSTMDataset
 
 use_cuda = torch.cuda.is_available()
+#use_cuda = False
 if use_cuda:
     device = torch.device("cuda")
 else:
@@ -162,7 +163,8 @@ class EncoderRNN(nn.Module):
     def __init__(self,
                  input_size: int = 2,
                  embedding_size: int = 8,
-                 hidden_size: int = 16):
+                 hidden_size: int = 16,
+                 num_layers: int = 3):
         """Initialize the encoder network.
 
         Args:
@@ -175,7 +177,7 @@ class EncoderRNN(nn.Module):
         self.hidden_size = hidden_size
 
         self.linear1 = nn.Linear(input_size, embedding_size)
-        self.lstm1 = nn.LSTMCell(embedding_size, hidden_size)
+        self.lstm1 = nn.LSTM(input_size=embedding_size, hidden_size=hidden_size, num_layers=num_layers)
 
     def forward(self, x: torch.FloatTensor, hidden: Any) -> Any:
         """Run forward propagation.
@@ -188,13 +190,13 @@ class EncoderRNN(nn.Module):
 
         """
         embedded = F.relu(self.linear1(x))
-        hidden = self.lstm1(embedded, hidden)
+        _, hidden = self.lstm1(embedded.unsqueeze(0), hidden)
         return hidden
 
 
 class DecoderRNN(nn.Module):
     """Decoder Network."""
-    def __init__(self, embedding_size=8, hidden_size=16, output_size=2):
+    def __init__(self, embedding_size=8, hidden_size=16, output_size=2, num_layers=3):
         """Initialize the decoder network.
 
         Args:
@@ -207,7 +209,7 @@ class DecoderRNN(nn.Module):
         self.hidden_size = hidden_size
 
         self.linear1 = nn.Linear(output_size, embedding_size)
-        self.lstm1 = nn.LSTMCell(embedding_size, hidden_size)
+        self.lstm1 = nn.LSTM(input_size=embedding_size, hidden_size=hidden_size, num_layers=num_layers)
         self.linear2 = nn.Linear(hidden_size, output_size)
 
     def forward(self, x, hidden):
@@ -222,8 +224,8 @@ class DecoderRNN(nn.Module):
 
         """
         embedded = F.relu(self.linear1(x))
-        hidden = self.lstm1(embedded, hidden)
-        output = self.linear2(hidden[0])
+        output, hidden = self.lstm1(embedded.unsqueeze(0), hidden)
+        output = self.linear2(output)
         return output, hidden
 
 
@@ -278,7 +280,7 @@ def train(
         # Initialize encoder hidden state
         encoder_hidden = model_utils.init_hidden(
             batch_size,
-            encoder.module.hidden_size if use_cuda else encoder.hidden_size)
+            encoder.module.hidden_size if use_cuda else encoder.hidden_size, 3)
 
         # Initialize losses
         loss = 0
@@ -300,6 +302,7 @@ def train(
         for di in range(rollout_len):
             decoder_output, decoder_hidden = decoder(decoder_input,
                                                      decoder_hidden)
+            decoder_output = decoder_output.squeeze(0)
             decoder_outputs[:, di, :] = decoder_output
 
             # Update loss
@@ -389,7 +392,7 @@ def validate(
         # Initialize encoder hidden state
         encoder_hidden = model_utils.init_hidden(
             batch_size,
-            encoder.module.hidden_size if use_cuda else encoder.hidden_size)
+            encoder.module.hidden_size if use_cuda else encoder.hidden_size, 3)
 
         # Initialize loss
         loss = 0
@@ -411,6 +414,7 @@ def validate(
         for di in range(output_length):
             decoder_output, decoder_hidden = decoder(decoder_input,
                                                      decoder_hidden)
+            decoder_output = decoder_output.squeeze(0)
             decoder_outputs[:, di, :] = decoder_output
 
             # Update losses for all benchmarks
@@ -511,7 +515,7 @@ def infer_absolute(
         # Initialize encoder hidden state
         encoder_hidden = model_utils.init_hidden(
             batch_size,
-            encoder.module.hidden_size if use_cuda else encoder.hidden_size)
+            encoder.module.hidden_size if use_cuda else encoder.hidden_size, 3)
 
         # Encode observed trajectory
         for ei in range(input_length):
@@ -531,6 +535,7 @@ def infer_absolute(
         for di in range(args.pred_len):
             decoder_output, decoder_hidden = decoder(decoder_input,
                                                      decoder_hidden)
+            decoder_output = decoder_output.squeeze(0)
             decoder_outputs[:, di, :] = decoder_output
 
             # Use own predictions as inputs at next step
@@ -619,7 +624,7 @@ def infer_map(
                 # Initialize encoder hidden state
                 encoder_hidden = model_utils.init_hidden(
                     1, encoder.module.hidden_size
-                    if use_cuda else encoder.hidden_size)
+                    if use_cuda else encoder.hidden_size, 3)
 
                 # Encode observed trajectory
                 for ei in range(input_length):
@@ -638,6 +643,7 @@ def infer_map(
                 for di in range(args.pred_len):
                     decoder_output, decoder_hidden = decoder(
                         decoder_input, decoder_hidden)
+                    decoder_output = decoder_output.squeeze(0)
                     decoder_outputs[:, di, :] = decoder_output
 
                     # Use own predictions as inputs at next step
@@ -761,7 +767,7 @@ def main():
         baseline_key = "none"
 
     # Get data
-    import pdb; pdb.set_trace();
+    #import pdb; pdb.set_trace();
     data_dict = baseline_utils.get_data(args, baseline_key)
 
     # Get model
@@ -855,9 +861,9 @@ def main():
                 collate_fn=model_utils.my_collate_fn,
                 )
             )
-        assert (len(train_loader) == len(val_loader)), \
+        assert (len(train_loaders) == len(val_loaders)), \
             "number of train loaders ({}) should be equal to number of val loaders ({})" \
-                .format(len(train_loader), len(val_loader))
+                .format(len(train_loaders), len(val_loaders))
         print("Training begins ...")
 
         decrement_counter = 0

@@ -26,11 +26,12 @@ from termcolor import cprint
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import copy
 
 from logger import Logger
 import utils.baseline_config as config
 import utils.baseline_utils_maml as baseline_utils
-from utils.lstm_utils_maml import ModelUtils, LSTMDataset
+from utils.lstm_utils_maml import ModelUtils, LSTMDataset, LSTMDataset_maml
 
 use_cuda = torch.cuda.is_available()
 if use_cuda:
@@ -148,6 +149,14 @@ def parse_arguments() -> Any:
                         type=int,
                         default=0,
                         help="Number of samples in the inside MAML loop")
+    parser.add_argument("--num_training_steps_per_iter",
+                        type=int,
+                        default=1,
+                        help="Number of steps inside an iter in a MAML loop")
+    parser.add_argument("--second_order",
+                        type=bool,
+                        default=True,
+                        help="Use second order gradients for MAML")
     return parser.parse_args()
 
 
@@ -393,16 +402,28 @@ def update_params(
 
     return updated_weights_dict
 
+def update_state_params(
+    state_dict,
+    param_dict,
+    grad_dict,
+):
+    args = parse_arguments()
+    for key in grad_dict.keys:
+        state_dict[key] = param_dict[key] - args.lr * grad_dict[key]
+
+    return state_dict
+
 def maml_inner_loop_update(
     loss,
     encoder,
     decoder,
-    encoder_dict,
-    decoder_dict,
     use_second_order,
 ):
     encoder.zero_grad()
     decoder.zero_grad()
+
+    encoder_dict = get_named_params_dicts(encoder)
+    decoder_dict = get_named_params_dicts(decoder)
 
     encoder_grads = torch.autograd.grad(loss, encoder_dict.values(), create_graph=use_second_order)
     decoder_grads = torch.autograd.grad(loss, decoder_dict.values(), create_graph=use_second_order)
@@ -410,10 +431,13 @@ def maml_inner_loop_update(
     encoder_grads_wrt_param_names = dict(zip(encoder_dict.keys(), encoder_grads))
     decoder_grads_wrt_param_names = dict(zip(decoder_dict.keys(), decoder_grads))
 
-    encoder_updated_weights_copy = update_params(encoder_dict, encoder_grads) 
-    decoder_updated_weights_copy = update_params(decoder_dict, decoder_grads) 
+    encoder_state_copy = copy.deepcopy(encoder.state_dict())
+    decoder_state_copy = copy.deepcopy(decoder.state_dict())
 
-    return encoder_updated_weights_copy, decoder_updated_weights_copy
+    encoder_updated_state = update_state_params(encoder_state_copy, encoder_dict, encoder_grads) 
+    decoder_updated_state = update_state_params(decoder_state_copy, decoder_dict, decoder_grads) 
+
+    return encoder_updated_state, decoder_updated_state
 
 def train_maml(
         train_loader: Any,
@@ -445,59 +469,61 @@ def train_maml(
     args = parse_arguments()
     global global_step
 
-    for i, (_input, target, helpers) in enumerate(train_loader):
-        _input = _input.to(device)
-        target = target.to(device)
+    for i, ((support_input_seq, support_obs_seq), (train_input_seq, train_obs_seq), helpers) in enumerate(train_loader):
+        support_input_seq = support_input_seq.to(device)
+        support_obs_seq = support_obs_seq.to(device)
+        train_input_seq = train_input_seq.to(device)
+        train_obs_seq = train_obs_seq.to(device)
+
+        # Copy the model for MAML inner loop
+        encoder_copy = copy.deepcopy(encoder)
+        decoder_copy = copy.deepcopy(decoder)
 
         # Set to train mode
         encoder.train()
         decoder.train()
+        encoder_copy.train()
+        decoder_copy.train()
+
+        train_loss = None
+       
+        for iter in range(args.num_training_steps_per_iter):
+            support_loss, supprt_pred = lstm_forward(
+                encoder_copy,
+                decoder_copy,
+                support_input_seq,
+                support_obs_seq,
+                args.obs_len,
+                args.pred_len,
+                criterion,
+                model_utils
+            )
+
+            encoder_state_copy, decoder_state_copy = maml_inner_loop_update(
+                support_loss, encoder_copy, decoder_copy, args.second_order
+            )
+
+            encoder_copy.load_state_dict(encoder_state_copy, strict=True)
+            decoder_copy.load_state_dict(decoder_state_copy, strict=True)
+
+            if(iter == args.num_training_steps_per_iter - 1):
+                train_loss, train_preds = lstm_forward(
+                    encoder_copy,
+                    decoder_copy,
+                    train_input_seq,
+                    train_obs_seq,
+                    args.obs_len,
+                    args.pred_len,
+                    criterion,
+                    model_utils
+                ) 
+
 
         # Zero the gradients
         encoder_optimizer.zero_grad()
         decoder_optimizer.zero_grad()
 
-        # Encoder
-        batch_size = _input.shape[0]
-        input_length = _input.shape[1]
-        output_length = target.shape[1]
-        input_shape = _input.shape[2]
-
-        # Initialize encoder hidden state
-        encoder_hidden = model_utils.init_hidden(
-            batch_size,
-            encoder.module.hidden_size if use_cuda else encoder.hidden_size)
-
-        # Initialize losses
-        loss = 0
-
-        # Encode observed trajectory
-        for ei in range(input_length):
-            encoder_input = _input[:, ei, :]
-            encoder_hidden = encoder(encoder_input, encoder_hidden)
-
-        # Initialize decoder input with last coordinate in encoder
-        decoder_input = encoder_input[:, :2]
-
-        # Initialize decoder hidden state as encoder hidden state
-        decoder_hidden = encoder_hidden
-
-        decoder_outputs = torch.zeros(target.shape).to(device)
-
-        # Decode hidden state in future trajectory
-        for di in range(rollout_len):
-            decoder_output, decoder_hidden = decoder(decoder_input,
-                                                     decoder_hidden)
-            decoder_outputs[:, di, :] = decoder_output
-
-            # Update loss
-            loss += criterion(decoder_output[:, :2], target[:, di, :2])
-
-            # Use own predictions as inputs at next step
-            decoder_input = decoder_output
-
-        # Get average loss for pred_len
-        loss = loss / rollout_len
+        loss = train_loss
 
         # Backpropagate
         loss.backward()
@@ -964,7 +990,7 @@ def main():
         train_dataset = None
         if args.maml: 
             seed = 0 # np.random.randint(10)
-            train_dataset = LSTMDataset_maml(data_dict, args, "train,", seed)
+            train_dataset = LSTMDataset_maml(data_dict, args, "train", seed)
         else:
             train_dataset = LSTMDataset(data_dict, args, "train")
         val_dataset = LSTMDataset(data_dict, args, "val")
@@ -990,6 +1016,7 @@ def main():
 
         decrement_counter = 0
 
+        import pdb; pdb.set_trace();
         epoch = start_epoch
         global_start_time = time.time()
         for i in range(start_rollout_idx, len(ROLLOUT_LENS)):

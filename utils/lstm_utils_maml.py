@@ -178,9 +178,9 @@ class LSTMDataset_maml(Dataset):
             train_obs_seq   = train_output_set[self.shot:]
 
             return(
-                (support_input_seq, train_input_seq), 
-                (support_obs_seq, train_obs_seq),
-                self.helpers(samples_list[self.shot:]),
+                (support_input_seq, support_obs_seq), 
+                (train_input_seq, train_obs_seq),
+                self.helpers[samples_list[self.shot:]],
             )
         else:
             return (

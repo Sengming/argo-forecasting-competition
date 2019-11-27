@@ -153,7 +153,7 @@ class LSTMDataset_maml(Dataset):
         return self.data_size
 
     def __getitem__(self, idx: int
-                    ) -> Tuple[Any, Any, Dict[str, np.ndarray]]:
+                    ) -> Any:
         """Get the element at the given index.
 
         Args:
@@ -168,9 +168,9 @@ class LSTMDataset_maml(Dataset):
         """
         if self.mode == "train":
             rng = np.random.RandomState(self.seed + idx)
-            samples_list = rng.choice(self.data_size, self.num_target_samples+self.shot, replace=False)
-            train_input_set = self.input_data[samples_list, :self.obs_len]
-            train_output_set = self.output_data[samples_list, :self.obs_len]
+            samples_list = np.array(rng.choice(self.data_size, self.num_target_samples+self.shot, replace=False))
+            train_input_set = self.input_data[samples_list, :]
+            train_output_set = self.output_data[samples_list, :]
 
             support_input_seq = train_input_set[:self.shot]
             support_obs_seq   = train_output_set[:self.shot]
@@ -178,9 +178,11 @@ class LSTMDataset_maml(Dataset):
             train_obs_seq   = train_output_set[self.shot:]
 
             return(
-                (support_input_seq, support_obs_seq), 
-                (train_input_seq, train_obs_seq),
-                self.helpers[samples_list[self.shot:]],
+                torch.FloatTensor(support_input_seq),
+                torch.FloatTensor(support_obs_seq), 
+                torch.FloatTensor(train_input_seq),
+                torch.FloatTensor(train_obs_seq),
+                [self.helpers[idx] for idx in samples_list[self.shot:]],
             )
         else:
             return (
@@ -312,6 +314,30 @@ class ModelUtils:
         _input = torch.stack(_input)
         output = torch.stack(output)
         return [_input, output, helpers]
+
+    def my_collate_fn_maml(self, batch: List[Any]) -> List[Any]:
+        """Collate function for PyTorch DataLoader.
+
+        Args:
+            batch: Batch data
+
+        Returns: 
+            input, output and helpers in the format expected by DataLoader
+
+        """
+        support_input, support_output, train_input, train_output, helpers = [], [], [], [], []
+
+        for item in batch:
+            support_input.append(item[0])
+            support_output.append(item[1])
+            train_input.append(item[2])
+            train_output.append(item[3])
+            helpers.append(item[4])
+        support_input = torch.stack(support_input)
+        support_output = torch.stack(support_output)
+        train_input = torch.stack(train_input)
+        train_output = torch.stack(train_output)
+        return [support_input, support_output, train_input, train_output, helpers]
 
     def init_hidden(self, batch_size: int,
                     hidden_size: int) -> Tuple[Any, Any]:

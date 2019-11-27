@@ -408,10 +408,11 @@ def update_state_params(
     grad_dict,
 ):
     args = parse_arguments()
-    for key in grad_dict.keys:
-        state_dict[key] = param_dict[key] - args.lr * grad_dict[key]
+    state_dict_copy = copy.deepcopy(state_dict)
+    for key in grad_dict.keys():
+        state_dict_copy[key] = param_dict[key] - args.lr * grad_dict[key]
 
-    return state_dict
+    return state_dict_copy
 
 def maml_inner_loop_update(
     loss,
@@ -431,13 +432,22 @@ def maml_inner_loop_update(
     encoder_grads_wrt_param_names = dict(zip(encoder_dict.keys(), encoder_grads))
     decoder_grads_wrt_param_names = dict(zip(decoder_dict.keys(), decoder_grads))
 
-    encoder_state_copy = copy.deepcopy(encoder.state_dict())
-    decoder_state_copy = copy.deepcopy(decoder.state_dict())
+    #encoder_state_copy = copy.deepcopy(encoder.state_dict())
+    #decoder_state_copy = copy.deepcopy(decoder.state_dict())
 
-    encoder_updated_state = update_state_params(encoder_state_copy, encoder_dict, encoder_grads) 
-    decoder_updated_state = update_state_params(decoder_state_copy, decoder_dict, decoder_grads) 
+    encoder_updated_state = update_state_params(encoder.state_dict(), encoder_dict, encoder_grads_wrt_param_names)
+    decoder_updated_state = update_state_params(decoder.state_dict(), decoder_dict, decoder_grads_wrt_param_names) 
 
     return encoder_updated_state, decoder_updated_state
+
+def update_model_grads(
+    model,
+    grad_dict
+):
+    for name, param in model.named_parameters():
+       for name_, grad in grad_dict:
+           if name == name_ :
+               param.grad = grad
 
 def train_maml(
         train_loader: Any,
@@ -469,75 +479,99 @@ def train_maml(
     args = parse_arguments()
     global global_step
 
-    for i, ((support_input_seq, support_obs_seq), (train_input_seq, train_obs_seq), helpers) in enumerate(train_loader):
-        support_input_seq = support_input_seq.to(device)
-        support_obs_seq = support_obs_seq.to(device)
-        train_input_seq = train_input_seq.to(device)
-        train_obs_seq = train_obs_seq.to(device)
+    for i, (support_input_seqs, support_obs_seqs, train_input_seqs, train_obs_seqs, helpers) in enumerate(train_loader):
+        support_input_seqs = support_input_seqs.to(device)
+        support_obs_seqs = support_obs_seqs.to(device)
+        train_input_seqs = train_input_seqs.to(device)
+        train_obs_seqs = train_obs_seqs.to(device)
+        
+        loss_list = []
+        for support_input_seq, support_obs_seq, train_input_seq, train_obs_seq in zip(support_input_seqs,
+                                                                                      support_obs_seqs,
+                                                                                      train_input_seqs,
+                                                                                      train_obs_seqs):
+            # Copy the model for MAML inner loop
+            encoder_copy = copy.deepcopy(encoder)
+            decoder_copy = copy.deepcopy(decoder)
 
-        # Copy the model for MAML inner loop
-        encoder_copy = copy.deepcopy(encoder)
-        decoder_copy = copy.deepcopy(decoder)
+            # Set to train mode
+            encoder.train()
+            decoder.train()
+            encoder_copy.train()
+            decoder_copy.train()
 
-        # Set to train mode
-        encoder.train()
-        decoder.train()
-        encoder_copy.train()
-        decoder_copy.train()
-
-        train_loss = None
+            train_loss = None
+            encoder_dict = get_named_params_dicts(encoder)
+            decoder_dict = get_named_params_dicts(decoder)
        
-        for iter in range(args.num_training_steps_per_iter):
-            support_loss, supprt_pred = lstm_forward(
-                encoder_copy,
-                decoder_copy,
-                support_input_seq,
-                support_obs_seq,
-                args.obs_len,
-                args.pred_len,
-                criterion,
-                model_utils
-            )
-
-            encoder_state_copy, decoder_state_copy = maml_inner_loop_update(
-                support_loss, encoder_copy, decoder_copy, args.second_order
-            )
-
-            encoder_copy.load_state_dict(encoder_state_copy, strict=True)
-            decoder_copy.load_state_dict(decoder_state_copy, strict=True)
-
-            if(iter == args.num_training_steps_per_iter - 1):
-                train_loss, train_preds = lstm_forward(
+            for iter in range(args.num_training_steps_per_iter):
+                support_loss, supprt_pred = lstm_forward(
                     encoder_copy,
                     decoder_copy,
-                    train_input_seq,
-                    train_obs_seq,
+                    support_input_seq,
+                    support_obs_seq,
                     args.obs_len,
                     args.pred_len,
                     criterion,
                     model_utils
-                ) 
+                )
+
+                encoder_state_copy, decoder_state_copy = maml_inner_loop_update(
+                    support_loss, encoder_copy, decoder_copy, args.second_order
+                )
+
+                encoder_copy.load_state_dict(encoder_state_copy, strict=True)
+                decoder_copy.load_state_dict(decoder_state_copy, strict=True)
+
+                if(iter == args.num_training_steps_per_iter - 1):
+                    train_loss, train_preds = lstm_forward(
+                        encoder_copy,
+                        decoder_copy,
+                        train_input_seq,
+                        train_obs_seq,
+                        args.obs_len,
+                        args.pred_len,
+                        criterion,
+                        model_utils
+                    ) 
 
 
-        # Zero the gradients
-        encoder_optimizer.zero_grad()
-        decoder_optimizer.zero_grad()
+            # Zero the gradients
+            encoder_optimizer.zero_grad()
+            decoder_optimizer.zero_grad()
 
-        loss = train_loss
+            loss = train_loss
 
-        # Backpropagate
-        loss.backward()
-        encoder_optimizer.step()
-        decoder_optimizer.step()
+            if global_step % 1000 == 0:
+                loss_list.append(loss.item())
+
+            # Backpropagate
+            # loss.backward()
+            encoder_grads = torch.autograd.grad(loss, encoder_dict.values())
+            decoder_grads = torch.autograd.grad(loss, decoder_dict.values())
+            encoder_grads_wrt_param_names = dict(zip(encoder_dict.keys(), encoder_grads))
+            decoder_grads_wrt_param_names = dict(zip(decoder_dict.keys(), decoder_grads))
+            
+           # for name, param in encoder.named_parameters():
+           #     for name_, grad in encoder_grads_wrt_param_names:
+           #         if name == name_ :
+           #             param.grad = grad
+
+            update_model_grads(encoder, encoder_grads_wrt_param_names)            
+            update_model_grads(decoder, decoder_grads_wrt_param_names)            
+
+            encoder_optimizer.step()
+            decoder_optimizer.step()
 
         if global_step % 1000 == 0:
 
             # Log results
+            avg_loss = np.array(loss_list).mean()
             print(
-                f"Train -- Epoch:{epoch}, loss:{loss}, Rollout:{rollout_len}")
+                f"Train -- Epoch:{epoch}, loss:{avg_loss}, Rollout:{rollout_len}")
 
             logger.scalar_summary(tag="Train/loss",
-                                  value=loss.item(),
+                                  value=avg_loss,
                                   step=epoch)
 
         global_step += 1
@@ -1001,7 +1035,7 @@ def main():
             batch_size=args.train_batch_size,
             shuffle=True,
             drop_last=False,
-            collate_fn=model_utils.my_collate_fn,
+            collate_fn=model_utils.my_collate_fn_maml if args.maml else model_utils.my_collate_fn,
         )
 
         val_loader = torch.utils.data.DataLoader(

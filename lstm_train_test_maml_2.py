@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
+import math
 
 from logger import Logger
 import utils.baseline_config as config
@@ -159,6 +160,211 @@ def parse_arguments() -> Any:
                         help="Use second order gradients for MAML")
     return parser.parse_args()
 
+
+class MetaLinearLayer(nn.Module):
+    def __init__(self, input_size, num_filters, use_bias):
+        """
+        A MetaLinear layer. Applies the same functionality of a standard linearlayer with the added functionality of
+        being able to receive a parameter dictionary at the forward pass which allows the convolution to use external
+        weights instead of the internal ones stored in the linear layer. Useful for inner loop optimization in the meta
+        learning setting.
+        :param input_shape: The shape of the input data, in the form (b, f)
+        :param num_filters: Number of output filters
+        :param use_bias: Whether to use biases or not.
+        """
+        super(MetaLinearLayer, self).__init__()
+        c = input_size
+
+        self.use_bias = use_bias
+        self.weights = nn.Parameter(torch.ones(num_filters, c))
+        nn.init.xavier_uniform_(self.weights)
+        if self.use_bias:
+            self.bias = nn.Parameter(torch.zeros(num_filters))
+
+    def forward(self, x, params=None):
+        """
+        Forward propagates by applying a linear function (Wx + b). If params are none then internal params are used.
+        Otherwise passed params will be used to execute the function.
+        :param x: Input data batch, in the form (b, f)
+        :param params: A dictionary containing 'weights' and 'bias'. If params are none then internal params are used.
+        Otherwise the external are used.
+        :return: The result of the linear function.
+        """
+        if params is not None:
+            #params = extract_top_level_dict(current_dict=params)
+            if self.use_bias:
+                (weight, bias) = params["weights"], params["bias"]
+            else:
+                (weight) = params["weights"]
+                bias = None
+        else:
+            pass
+            #print('no inner loop params', self)
+
+            if self.use_bias:
+                weight, bias = self.weights, self.bias
+            else:
+                weight = self.weights
+                bias = None
+        # print(x.shape)
+        out = F.linear(input=x, weight=weight, bias=bias)
+        return out
+
+
+class MetaLSTMCell(nn.Module):
+
+    def __init__(self, input_size, hidden_size, bias=True):
+        super(MetaLSTMCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.bias = bias
+        self.i2h = MetaLinearLayer(input_size, 4 * hidden_size, use_bias=bias)
+        self.h2h = MetaLinearLayer(hidden_size,  4 * hidden_size, use_bias=bias)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        std = 1.0 / math.sqrt(self.hidden_size)
+        for w in self.parameters():
+            w.data.uniform_(-std, std)
+
+    def forward(self, x, hidden, params=None):
+        if hidden is None:
+            hidden = self._init_hidden(x)
+        h, c = hidden
+        # h = h.view(h.size(1), -1)
+        # c = c.view(c.size(1), -1)
+        # x = x.view(x.size(1), -1)
+
+        # Linear mappings
+        preact = self.i2h(x, (None if (params == None) else params['i2h'])) + \
+                    self.h2h(h, (None if (params == None) else params['h2h']))
+
+        # activations
+        gates = preact[:, :3 * self.hidden_size].sigmoid()
+        g_t = preact[:, 3 * self.hidden_size:].tanh()
+        i_t = gates[:, :self.hidden_size]
+        f_t = gates[:, self.hidden_size:2 * self.hidden_size]
+        o_t = gates[:, -self.hidden_size:]
+
+        c_t = torch.mul(c, f_t) + torch.mul(i_t, g_t)
+
+        h_t = torch.mul(o_t, c_t.tanh())
+
+        # h_t = h_t.view(1, h_t.size(0), -1)
+        # c_t = c_t.view(1, c_t.size(0), -1)
+        # return h_t, (h_t, c_t)
+        return (h_t, c_t)
+    
+    @staticmethod
+    def _init_hidden(input_):
+        h = torch.zeros_like(input_.view(1, input_.size(1), -1))
+        c = torch.zeros_like(input_.view(1, input_.size(1), -1))
+        return h, c
+
+class MetaEncoderRNN(nn.Module):
+    """Encoder Network."""
+    def __init__(self,
+                 input_size: int = 2,
+                 embedding_size: int = 8,
+                 hidden_size: int = 16):
+        """Initialize the encoder network.
+
+        Args:
+            input_size: number of features in the input
+            embedding_size: Embedding size
+            hidden_size: Hidden size of LSTM
+
+        """
+        super(MetaEncoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+
+        self.linear1 = MetaLinearLayer(input_size, embedding_size, use_bias=True)
+        self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
+
+    def forward(self, x: torch.FloatTensor, hidden, param=None):
+        """Run forward propagation.
+
+        Args:
+            x: input to the network
+            hidden: initial hidden state
+        Returns:
+            hidden: final hidden 
+
+        """
+        param_dict = None if param == None else self.preprocess_param_dict(param)
+        embedded = F.relu(self.linear1(x, (None if param == None else param_dict['linear1'])))
+        hidden = self.lstm1(embedded, hidden, (None if param == None else param_dict['lstm1']))
+        return hidden
+    
+    def preprocess_param_dict(self, param_dict):
+        reordered_dict = {}
+        reordered_dict['linear1'] = {}
+        reordered_dict['lstm1'] ={}
+        reordered_dict['lstm1']['i2h'] ={}
+        reordered_dict['lstm1']['h2h'] ={}
+        for name, param in param_dict.items():
+            names_split = name.split('.')
+            if names_split[0] == 'linear1':
+                reordered_dict['linear1'][names_split[1]] = param
+            elif names_split[0] == 'lstm1':
+                if names_split[1] == 'i2h':
+                    reordered_dict['lstm1']['i2h'][names_split[2]] = param
+                elif names_split[1] == 'h2h':
+                    reordered_dict['lstm1']['h2h'][names_split[2]] = param
+        return reordered_dict
+
+class MetaDecoderRNN(nn.Module):
+    """Encoder Network."""
+    def __init__(self, embedding_size=8, hidden_size=16, output_size=2):
+
+        """Args:
+            embedding_size: Embedding size
+            hidden_size: Hidden size of LSTM
+            output_size: number of features in the output
+        """
+        super(MetaDecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+
+        self.linear1 = MetaLinearLayer(output_size, embedding_size, use_bias=True)
+        self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
+        self.linear2 = MetaLinearLayer(hidden_size, output_size, use_bias=True)
+
+    def forward(self, x: torch.FloatTensor, hidden, param=None):
+        """Run forward propagation.
+
+        Args:
+            x: input to the network
+            hidden: initial hidden state
+        Returns:
+            hidden: final hidden 
+
+        """
+        param_dict = None if param == None else self.preprocess_param_dict(param)
+        embedded = F.relu(self.linear1(x, (None if param == None else param_dict['linear1'])))
+        hidden = self.lstm1(embedded, hidden, (None if param == None else param_dict['lstm1']))
+        output = self.linear2(hidden[0], (None if param == None else param_dict['linear2']))
+        return output, hidden
+    
+    def preprocess_param_dict(self, param_dict):
+        reordered_dict = {}
+        reordered_dict['linear1'] = {}
+        reordered_dict['linear2'] = {}
+        reordered_dict['lstm1'] ={}
+        reordered_dict['lstm1']['i2h'] ={}
+        reordered_dict['lstm1']['h2h'] ={}
+        for name, param in param_dict.items():
+            names_split = name.split('.')
+            if names_split[0] == 'linear1':
+                reordered_dict['linear1'][names_split[1]] = param
+            elif names_split[0] == 'lstm1':
+                if names_split[1] == 'i2h':
+                    reordered_dict['lstm1']['i2h'][names_split[2]] = param
+                elif names_split[1] == 'h2h':
+                    reordered_dict['lstm1']['h2h'][names_split[2]] = param
+            elif names_split[0] == 'linear2':
+                reordered_dict['linear2'][names_split[1]] = param
+        return reordered_dict
+  
 
 class EncoderRNN(nn.Module):
     """Encoder Network."""
@@ -334,6 +540,8 @@ def train(
 def lstm_forward(
     encoder: Any,
     decoder: Any,
+    encoder_params: Any,
+    decoder_params: Any,
     input_seq: Any,
     target_seq: Any,
     obs_len: int,
@@ -354,7 +562,7 @@ def lstm_forward(
     # Encode observed trajectory
     for ei in range(obs_len):
         encoder_input = input_seq[:, ei, :]
-        encoder_hidden = encoder(encoder_input, encoder_hidden)
+        encoder_hidden = encoder(encoder_input, encoder_hidden, encoder_params)
 
     # Initialize decoder input with last coordinate in encoder
     decoder_input = encoder_input[:, :2]
@@ -367,7 +575,7 @@ def lstm_forward(
     # Decode hidden state in future trajectory
     for di in range(pred_len):
         decoder_output, decoder_hidden = decoder(decoder_input,
-                                                 decoder_hidden)
+                                                 decoder_hidden, decoder_params)
         decoder_outputs[:, di, :] = decoder_output
 
         # Update loss
@@ -387,44 +595,55 @@ def get_named_params_dicts(
     params_dict = dict()
     for name, param in model.named_parameters():
         if param.requires_grad:
-            params_dict[name] = param.to(device)
+            key = (name.replace('module.', '')) if 'module.' in name else name
+            params_dict[key] = param.to(device)
     
     return params_dict
 
-
-def update_state_params(
+def update_params(
     param_dict,
     grad_dict,
 ):
     args = parse_arguments()
-    param_dict_updated = dict()
+    updated_weights_dict = dict()
     for key in grad_dict.keys():
-        param_dict_updated[key] = param_dict[key] - args.lr * grad_dict[key]
+        updated_weights_dict[key] = param_dict[key] - args.lr * grad_dict[key]
 
-    return param_dict_updated
+    return updated_weights_dict
+
+def update_state_params(
+    state_dict,
+    param_dict,
+    grad_dict,
+):
+    args = parse_arguments()
+    state_dict_copy = copy.deepcopy(state_dict)
+    for key in grad_dict.keys():
+        state_dict_copy[key] = param_dict[key] - args.lr * grad_dict[key]
+
+    return state_dict_copy
 
 def maml_inner_loop_update(
     loss,
     encoder,
     decoder,
+    encoder_params,
+    decoder_params,
     use_second_order,
 ):
-    encoder.zero_grad()
-    decoder.zero_grad()
+    zero_grad(encoder, encoder_params)
+    zero_grad(decoder, decoder_params)
 
-    encoder_dict = get_named_params_dicts(encoder)
-    decoder_dict = get_named_params_dicts(decoder)
+    encoder_grads = torch.autograd.grad(loss, encoder_params.values(), create_graph=use_second_order)
+    decoder_grads = torch.autograd.grad(loss, decoder_params.values(), create_graph=use_second_order)
 
-    encoder_grads = torch.autograd.grad(loss, encoder_dict.values(), create_graph=use_second_order)
-    decoder_grads = torch.autograd.grad(loss, decoder_dict.values(), create_graph=use_second_order)
+    encoder_grads_wrt_param_names = dict(zip(encoder_params.keys(), encoder_grads))
+    decoder_grads_wrt_param_names = dict(zip(decoder_params.keys(), decoder_grads))
 
-    encoder_grads_wrt_param_names = dict(zip(encoder_dict.keys(), encoder_grads))
-    decoder_grads_wrt_param_names = dict(zip(decoder_dict.keys(), decoder_grads))
+    encoder_params = update_params(encoder_params, encoder_grads_wrt_param_names)
+    decoder_params = update_params(decoder_params, decoder_grads_wrt_param_names) 
 
-    encoder_updated_state = update_state_params(encoder.state_dict(), encoder_dict, encoder_grads_wrt_param_names)
-    decoder_updated_state = update_state_params(decoder.state_dict(), decoder_dict, decoder_grads_wrt_param_names) 
-
-    return encoder_updated_state, decoder_updated_state
+    return encoder_params, decoder_params
 
 def update_model_grads(
     model,
@@ -434,6 +653,28 @@ def update_model_grads(
        for name_, grad in grad_dict:
            if name == name_ :
                param.grad = grad
+
+def clamp_grads(model):
+    for name, param in model.named_parameters():
+         if param.requires_grad:
+             param.grad.data.clamp_(-10, 10)  
+
+def zero_grad(model, params=None):
+    if params is None:
+        for param in model.parameters():
+            if param.requires_grad == True:
+                if param.grad is not None:
+                    if torch.sum(param.grad) > 0:
+                        #print(param.grad)
+                        param.grad.zero_()
+    else:
+        for name, param in params.items():
+            if param.requires_grad == True:
+                if param.grad is not None:
+                    if torch.sum(param.grad) > 0:
+                        #print(param.grad)
+                        param.grad.zero_()
+                        params[name].grad = None
 
 def train_maml(
         train_loader: Any,
@@ -464,6 +705,10 @@ def train_maml(
     """
     args = parse_arguments()
     global global_step
+    encoder.zero_grad()
+    decoder.zero_grad()
+    encoder.train()
+    decoder.train()
 
     for i, (support_input_seqs, support_obs_seqs, train_input_seqs, train_obs_seqs, helpers) in enumerate(train_loader):
         support_input_seqs = support_input_seqs.to(device)
@@ -472,19 +717,14 @@ def train_maml(
         train_obs_seqs = train_obs_seqs.to(device)
         
         loss_list = []
-        for support_input_seq, support_obs_seq, train_input_seq, train_obs_seq in zip(support_input_seqs,
-                                                                                      support_obs_seqs,
-                                                                                      train_input_seqs,
-                                                                                      train_obs_seqs):
+        for j, (support_input_seq, support_obs_seq, train_input_seq, train_obs_seq) in enumerate(
+                                                                                        zip(support_input_seqs,
+                                                                                            support_obs_seqs,
+                                                                                            train_input_seqs,
+                                                                                            train_obs_seqs)):
             # Copy the model for MAML inner loop
-            encoder_copy = copy.deepcopy(encoder)
-            decoder_copy = copy.deepcopy(decoder)
-
-            # Set to train mode
-            encoder.train()
-            decoder.train()
-            encoder_copy.train()
-            decoder_copy.train()
+            encoder_copy_params = get_named_params_dicts(encoder)
+            decoder_copy_params = get_named_params_dicts(decoder)
 
             train_loss = None
             encoder_dict = get_named_params_dicts(encoder)
@@ -492,8 +732,10 @@ def train_maml(
        
             for iter in range(args.num_training_steps_per_iter):
                 support_loss, supprt_pred = lstm_forward(
-                    encoder_copy,
-                    decoder_copy,
+                    encoder,
+                    decoder,
+                    encoder_copy_params,
+                    decoder_copy_params,
                     support_input_seq,
                     support_obs_seq,
                     args.obs_len,
@@ -502,33 +744,16 @@ def train_maml(
                     model_utils
                 )
 
-                encoder_state_copy, decoder_state_copy = maml_inner_loop_update(
-                    support_loss, encoder_copy, decoder_copy, args.second_order
+                encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
+                    support_loss, encoder, decoder, encoder_copy_params, decoder_copy_params, args.second_order
                 )
-
-                #encoder_copy_copy = EncoderRNN(
-                #    input_size=len(baseline_utils.BASELINE_INPUT_FEATURES['map']))
-                #decoder_copy_copy = DecoderRNN(output_size=2)
-                encoder_copy_copy = copy.deepcopy(encoder_copy)
-                decoder_copy_copy = copy.deepcopy(decoder_copy)
-                #encoder_copy.load_state_dict(encoder_state_copy, strict=True)
-                #decoder_copy.load_state_dict(decoder_state_copy, strict=True)
-                
-                #encoder_copy_copy = EncoderRNN()
-                #decoder_copy_copy = DecoderRNN()
-
-                encoder_copy_copy.load_state_dict(encoder_state_copy, strict=True)
-                decoder_copy_copy.load_state_dict(decoder_state_copy, strict=True)
-                encoder_copy_copy.to(device)
-                decoder_copy_copy.to(device)
-                encoder_copy_copy.train()
-                decoder_copy_copy.train()
-
 
                 if(iter == args.num_training_steps_per_iter - 1):
                     train_loss, train_preds = lstm_forward(
-                        encoder_copy_copy,
-                        decoder_copy_copy,
+                        encoder,
+                        decoder,
+                        encoder_copy_params,
+                        decoder_copy_params,
                         train_input_seq,
                         train_obs_seq,
                         args.obs_len,
@@ -548,29 +773,24 @@ def train_maml(
                 loss_list.append(loss.item())
 
             # Backpropagate
-            # loss.backward()
-            encoder_grads = torch.autograd.grad(loss, encoder_dict.values(), allow_unused=True)
-            decoder_grads = torch.autograd.grad(loss, decoder_dict.values(), allow_unused=True)
-            encoder_grads_wrt_param_names = dict(zip(encoder_dict.keys(), encoder_grads))
-            decoder_grads_wrt_param_names = dict(zip(decoder_dict.keys(), decoder_grads))
-            
-           # for name, param in encoder.named_parameters():
-           #     for name_, grad in encoder_grads_wrt_param_names:
-           #         if name == name_ :
-           #             param.grad = grad
-
-            update_model_grads(encoder, encoder_grads_wrt_param_names)            
-            update_model_grads(decoder, decoder_grads_wrt_param_names)            
+            loss.backward()
+            clamp_grads(encoder)
+            clamp_grads(decoder)
 
             encoder_optimizer.step()
             decoder_optimizer.step()
+            if j % 100 == 0:
+                print(
+                    f"Training inner loop {j}-- Epoch:{epoch}, loss:{loss}, Rollout:{rollout_len}")
 
         if global_step % 1000 == 0:
 
             # Log results
             avg_loss = np.array(loss_list).mean()
             print(
-                f"Train -- Epoch:{epoch}, loss:{avg_loss}, Rollout:{rollout_len}")
+                f"--------------------------------------\n\
+                Train -- Epoch:{epoch}, avg loss:{avg_loss}, Rollout:{rollout_len}\n\
+                --------------------------------------")
 
             logger.scalar_summary(tag="Train/loss",
                                   value=avg_loss,
@@ -993,9 +1213,14 @@ def main():
 
     # Get model
     criterion = nn.MSELoss()
-    encoder = EncoderRNN(
-        input_size=len(baseline_utils.BASELINE_INPUT_FEATURES[baseline_key]))
-    decoder = DecoderRNN(output_size=2)
+    if args.maml:
+        encoder = MetaEncoderRNN(
+            input_size=len(baseline_utils.BASELINE_INPUT_FEATURES[baseline_key]))
+        decoder = MetaDecoderRNN(output_size=2)
+    else:
+        encoder = EncoderRNN(
+            input_size=len(baseline_utils.BASELINE_INPUT_FEATURES[baseline_key]))
+        decoder = DecoderRNN(output_size=2)
     if use_cuda:
         encoder = nn.DataParallel(encoder)
         decoder = nn.DataParallel(decoder)
@@ -1052,7 +1277,7 @@ def main():
 
         decrement_counter = 0
 
-        import pdb; pdb.set_trace();
+        #import pdb; pdb.set_trace();
         epoch = start_epoch
         global_start_time = time.time()
         for i in range(start_rollout_idx, len(ROLLOUT_LENS)):

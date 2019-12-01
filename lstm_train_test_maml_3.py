@@ -1218,8 +1218,8 @@ def validate_maml(
         logger: Logger,
         encoder: Any,
         decoder: Any,
-        encoder_optimizer: Any,
-        decoder_optimizer: Any,
+        encoder_optimizers: Any,
+        decoder_optimizers: Any,
         model_utils: ModelUtils,
         loader_len,
         prev_loss: float,
@@ -1250,6 +1250,9 @@ def validate_maml(
     total_loss = []
 
     per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch)
+
+    encoder_optimizer, encoder_scheduler = encoder_optimizers
+    decoder_optimizer, decoder_scheduler = decoder_optimizers
 
     with tqdm(total=loader_len, desc='Epoch: {}'.format(epoch), position=0) as pbar:
         for i, data_batch in enumerate(val_loader):

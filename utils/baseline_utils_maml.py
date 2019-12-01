@@ -807,3 +807,6 @@ class LSLRGradientDescentLearningRule(nn.Module):
                  self.names_learning_rates_dict[key.replace(".", "-")][step] * grad_dict[key]
     
         return updated_weights_dict
+
+    def get_lr_dict(self):
+        return self.names_learning_rates_dict

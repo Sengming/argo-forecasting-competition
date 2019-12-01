@@ -236,6 +236,123 @@ class LSTMDataset_maml(Dataset):
         return tuple(helpers)
 
 
+class LSTMDataset_maml_simplified(Dataset):
+    """PyTorch Dataset for LSTM Baselines."""
+    def __init__(self, data_dict: Dict[str, Any], args: Any, mode: str, seed: int):
+        """Initialize the Dataset.
+        Args:
+            data_dict: Dict containing all the data
+            args: Arguments passed to the baseline code
+            mode: train/val/test mode
+
+        """
+        self.data_dict = data_dict
+        self.args = args
+        self.mode = mode
+        self.seed = seed
+        if mode != "test":
+            self.obs_len = args.obs_len
+            self.num_target_samples = args.num_target_samples
+            self.shot = args.shot
+
+
+        # Get input
+        self.input_data = data_dict["{}_input".format(mode)]
+        if mode != "test":
+            self.output_data = data_dict["{}_output".format(mode)]
+        self.data_size = self.input_data.shape[0]
+
+        # Get helpers
+        self.helpers = self.get_helpers()
+        self.helpers = list(zip(*self.helpers))
+
+    def __len__(self):
+        """Get length of dataset.
+
+        Returns:
+            Length of dataset
+
+        """
+        return self.data_size
+
+    def __getitem__(self, idx: int
+                    ) -> Any:
+        """Get the element at the given index.
+
+        Args:
+            idx: Query index
+
+        Returns:
+        if train
+            A list containing (support_set, input) Tensor, (support_set_target, Output) Tensor (Empty if test) and viz helpers. 
+        else
+            A list containing input Tensor, Output Tensor (Empty if test) and viz helpers. 
+
+        """
+        rng = np.random.RandomState(self.seed + idx)
+        #samples_list = np.concatenate((np.array(rng.choice(self.data_size, self.shot, replace=False)), np.array([idx])))
+        samples_list = np.concatenate((rng.randint(0, self.data_size, 1), np.array([idx])))
+        train_input_set = self.input_data[samples_list, :]
+        support_input_seq = train_input_set[:1]
+        train_input_seq = train_input_set[1:]
+
+        train_output_set = self.output_data[samples_list, :] if self.mode != 'test' else None
+        support_obs_seq   = train_output_set[:1] if self.mode !='test' else None
+        train_obs_seq   = train_output_set[1:] if self.mode != 'test' else None
+
+        return(
+            torch.FloatTensor(support_input_seq),
+            torch.FloatTensor(support_obs_seq), 
+            torch.FloatTensor(train_input_seq),
+            torch.FloatTensor(train_obs_seq),
+            [self.helpers[idx] for idx in samples_list[1:]],
+        )
+
+
+    def get_helpers(self) -> Tuple[Any]:
+        """Get helpers for running baselines.
+
+        Returns:
+            helpers: Tuple in the format specified by LSTM_HELPER_DICT_IDX
+
+        Note: We need a tuple because DataLoader needs to index across all these helpers simultaneously.
+
+        """
+        helper_df = self.data_dict[f"{self.mode}_helpers"]
+        candidate_centerlines = helper_df["CANDIDATE_CENTERLINES"].values
+        candidate_nt_distances = helper_df["CANDIDATE_NT_DISTANCES"].values
+        xcoord = np.stack(helper_df["FEATURES"].values
+                          )[:, :, config.FEATURE_FORMAT["X"]].astype("float")
+        ycoord = np.stack(helper_df["FEATURES"].values
+                          )[:, :, config.FEATURE_FORMAT["Y"]].astype("float")
+        centroids = np.stack((xcoord, ycoord), axis=2)
+        _DEFAULT_HELPER_VALUE = np.full((centroids.shape[0]), None)
+        city_names = np.stack(helper_df["FEATURES"].values
+                              )[:, :, config.FEATURE_FORMAT["CITY_NAME"]]
+        seq_paths = helper_df["SEQUENCE"].values
+        translation = (helper_df["TRANSLATION"].values
+                       if self.args.normalize else _DEFAULT_HELPER_VALUE)
+        rotation = (helper_df["ROTATION"].values
+                    if self.args.normalize else _DEFAULT_HELPER_VALUE)
+
+        use_candidates = self.args.use_map and self.mode == "test"
+
+        candidate_delta_references = (
+            helper_df["CANDIDATE_DELTA_REFERENCES"].values
+            if self.args.use_map and use_candidates else _DEFAULT_HELPER_VALUE)
+        delta_reference = (helper_df["DELTA_REFERENCE"].values
+                           if self.args.use_delta and not use_candidates else
+                           _DEFAULT_HELPER_VALUE)
+
+        helpers = [None for i in range(len(config.LSTM_HELPER_DICT_IDX))]
+
+        # Name of the variables should be the same as keys in LSTM_HELPER_DICT_IDX
+        for k, v in config.LSTM_HELPER_DICT_IDX.items():
+            helpers[v] = locals()[k.lower()]
+
+        return tuple(helpers)
+
+
 class ModelUtils:
     """Utils for LSTM baselines."""
     def save_checkpoint(self, save_dir: str, state: Dict[str, Any]) -> None:

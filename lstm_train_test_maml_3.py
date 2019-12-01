@@ -28,6 +28,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 import math
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 from logger import Logger
 import utils.baseline_config as config
@@ -166,7 +169,18 @@ def parse_arguments() -> Any:
     parser.add_argument("--num_workers",
                          type=int,
                          default=8,
-                         help="Number of steps inside an iter in a MAML loop")
+                         help="Number of CPU threads used for the dataloader")
+    parser.add_argument("--use_lslr",
+                        action="store_true",
+                        help="Use LSLR learning rule")
+    parser.add_argument("--use_learnable_lr",
+                        action="store_true",
+                        help="Use learnable LR during LSLR")
+    parser.add_argument("--min_lr",
+                         type=float,
+                         default=.001,
+                         help="Number of CPU threads used for the dataloader")
+
     return parser.parse_args()
 
 
@@ -312,7 +326,8 @@ class MetaEncoderRNN(nn.Module):
         reordered_dict['lstm1']['i2h'] ={}
         reordered_dict['lstm1']['h2h'] ={}
         for name, param in param_dict.items():
-            names_split = name.split('.')
+            key = (name.replace('module.', '')) if 'module.' in name else name
+            names_split = key.split('.')
             if names_split[0] == 'linear1':
                 reordered_dict['linear1'][names_split[1]] = param
             elif names_split[0] == 'lstm1':
@@ -362,7 +377,8 @@ class MetaDecoderRNN(nn.Module):
         reordered_dict['lstm1']['i2h'] ={}
         reordered_dict['lstm1']['h2h'] ={}
         for name, param in param_dict.items():
-            names_split = name.split('.')
+            key = (name.replace('module.', '')) if 'module.' in name else name
+            names_split = key.split('.')
             if names_split[0] == 'linear1':
                 reordered_dict['linear1'][names_split[1]] = param
             elif names_split[0] == 'lstm1':
@@ -443,6 +459,40 @@ class DecoderRNN(nn.Module):
         hidden = self.lstm1(embedded, hidden)
         output = self.linear2(hidden[0])
         return output, hidden
+
+def plot_grad_flow(encoder_parameters, decoder_parameters):
+    '''Plots the gradients flowing through different layers in the net during training.
+    Can be used for checking for possible gradient vanishing / exploding problems.
+    
+    Usage: Plug this function in Trainer class after loss.backwards() as 
+    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
+    ave_grads = []
+    max_grads= []
+    layers_enc = []
+    for n, p in encoder_parameters:
+        if(p.requires_grad) and ("bias" not in n):
+            layers_enc.append('encoder.'+n)
+            ave_grads.append(p.grad.abs().mean())
+            max_grads.append(p.grad.abs().max())
+    for n, p in decoder_parameters:
+        if(p.requires_grad) and ("bias" not in n):
+            layers_enc.append('decoder.'+n)
+            ave_grads.append(p.grad.abs().mean())
+            max_grads.append(p.grad.abs().max())
+    plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
+    plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
+    plt.hlines(0, 0, len(ave_grads)+1, lw=2, color="k" )
+    plt.xticks(range(0,len(ave_grads), 1), layers_enc, rotation="vertical")
+    plt.xlim(left=0, right=len(ave_grads))
+    plt.ylim(bottom = -0.001, top=0.02) # zoom in on the lower gradient regions
+    plt.xlabel("Layers")
+    plt.ylabel("average gradient")
+    plt.title("Gradient flow")
+    plt.grid(True)
+    plt.legend([Line2D([0], [0], color="c", lw=4),
+                Line2D([0], [0], color="b", lw=4),
+                Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
+
 
 
 def train(
@@ -604,8 +654,18 @@ def get_named_params_dicts(
     params_dict = dict()
     for name, param in model.named_parameters():
         if param.requires_grad:
-            key = (name.replace('module.', '')) if 'module.' in name else name
-            params_dict[key] = param.to(device)
+            #key = (name.replace('module.', '')) if 'module.' in name else name
+            params_dict[name] = param.to(device)
+    
+    return params_dict
+
+def get_raw_named_params_dicts(
+    model: Any,
+):
+    params_dict = dict()
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            params_dict[name] = param.to(device)
     
     return params_dict
 
@@ -639,6 +699,9 @@ def maml_inner_loop_update(
     encoder_params,
     decoder_params,
     use_second_order,
+    encoder_learning_rule = None,
+    decoder_learning_rule = None,
+    step = 0,
 ):
     zero_grad(encoder, encoder_params)
     zero_grad(decoder, decoder_params)
@@ -649,8 +712,16 @@ def maml_inner_loop_update(
     encoder_grads_wrt_param_names = dict(zip(encoder_params.keys(), encoder_grads))
     decoder_grads_wrt_param_names = dict(zip(decoder_params.keys(), decoder_grads))
 
-    encoder_params = update_params(encoder_params, encoder_grads_wrt_param_names)
-    decoder_params = update_params(decoder_params, decoder_grads_wrt_param_names) 
+    if encoder_learning_rule == None:
+        encoder_params = update_params(encoder_params, encoder_grads_wrt_param_names)
+    else:
+        encoder_params = encoder_learning_rule.update_params(encoder_params, encoder_grads_wrt_param_names, step)
+        
+    if decoder_learning_rule == None:
+        decoder_params = update_params(decoder_params, decoder_grads_wrt_param_names) 
+    else:
+        decoder_params = decoder_learning_rule.update_params(decoder_params, decoder_grads_wrt_param_names, step)
+
 
     return encoder_params, decoder_params
 
@@ -684,6 +755,27 @@ def zero_grad(model, params=None):
                         #print(param.grad)
                         param.grad.zero_()
                         params[name].grad = None
+
+def get_per_step_loss_importance_vector(args, current_epoch):
+    """
+    Generates a tensor of dimensionality (num_inner_loop_steps) indicating the importance of each step's target
+    loss towards the optimization loss.
+    :return: A tensor to be used to compute the weighted average of the loss, useful for
+    the MSL (Multi Step Loss) mechanism.
+    """
+    loss_weights = np.ones(shape=(args.num_training_steps_per_iter)) * (
+            1.0 / args.num_training_steps_per_iter)
+    decay_rate = 1.0 / args.num_training_steps_per_iter / args.end_epoch
+    min_value_for_non_final_losses = 0.03 / args.num_training_steps_per_iter
+    for i in range(len(loss_weights) - 1):
+        loss_weights[i] = np.maximum(loss_weights[i] - (current_epoch * decay_rate), min_value_for_non_final_losses)
+
+    curr_value = np.minimum(
+        loss_weights[-1] + (current_epoch * (args.num_training_steps_per_iter - 1) * decay_rate),
+        1.0 - ((args.num_training_steps_per_iter - 1) * min_value_for_non_final_losses))
+    loss_weights[-1] = curr_value
+    loss_weights = torch.Tensor(loss_weights).to(device=device)
+    return loss_weights
 
 def train_maml(
         train_loader: Any,
@@ -826,6 +918,7 @@ def train_maml_simplified(
         epoch: epoch number
         criterion: Loss criterion
         logger: Tensorboard logger
+                        train_loader_len,
         encoder: Encoder network instance
         decoder: Decoder network instance
         encoder_optimizer: optimizer for the encoder network
@@ -840,7 +933,7 @@ def train_maml_simplified(
     decoder.zero_grad()
     encoder.train()
     decoder.train()
-    import pdb; pdb.set_trace();
+    #import pdb; pdb.set_trace();
     for i, (support_input_seqs, support_obs_seqs, train_input_seqs, train_obs_seqs, helpers) in enumerate(train_loader):
         #support_input_seqs = support_input_seqs.to(device)
         #support_obs_seqs = support_obs_seqs.to(device)
@@ -869,7 +962,11 @@ def train_maml_simplified(
             train_loss = None
             encoder_dict = get_named_params_dicts(encoder)
             decoder_dict = get_named_params_dicts(decoder)
-       
+
+            per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch)
+
+            total_losses = []
+
             for iter in range(args.num_training_steps_per_iter):
                 support_loss, supprt_pred = lstm_forward(
                     encoder,
@@ -883,6 +980,8 @@ def train_maml_simplified(
                     criterion,
                     model_utils
                 )
+
+                total_losses.append(per_step_loss_importance_vecor[iter] * support_loss)
 
                 encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
                     support_loss, encoder, decoder, encoder_copy_params, decoder_copy_params, args.second_order
@@ -901,13 +1000,15 @@ def train_maml_simplified(
                         criterion,
                         model_utils
                     ) 
+                    total_losses.append(train_loss)
 
 
             # Zero the gradients
             encoder_optimizer.zero_grad()
             decoder_optimizer.zero_grad()
 
-            loss = train_loss
+            #loss = train_loss
+            loss = torch.sum(torch.stack(total_losses))
 
             if global_step % 1000 == 0:
                 loss_list.append(loss.item())
@@ -938,6 +1039,85 @@ def train_maml_simplified(
 
         global_step += 1
 
+def maml_forward(
+        args : Any,
+        data_batch: Any,
+        epoch: int,
+        criterion: Any,
+        encoder: Any,
+        decoder: Any,
+        model_utils: ModelUtils,
+        per_step_loss_importance_vecor,
+        second_order = False,
+        rollout_len: int = 30,
+        encoder_learning_rule = None,
+        decoder_learning_rule = None,
+):
+
+    #import pdb; pdb.set_trace();
+    (support_input_seqs, support_obs_seqs, train_input_seq, train_obs_seq, _) = data_batch
+
+    train_input_seq = train_input_seq.squeeze(1).to(device)
+    train_obs_seq = train_obs_seq.squeeze(1).to(device)
+
+        # Copy the model for MAML inner loop
+    shot = args.shot if args.shot <= args.train_batch_size else args.train_batch_size
+    support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
+    support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
+
+    encoder_copy_params = get_named_params_dicts(encoder)
+    decoder_copy_params = get_named_params_dicts(decoder)
+
+    train_loss = None
+    encoder_dict = get_named_params_dicts(encoder)
+    decoder_dict = get_named_params_dicts(decoder)
+
+    total_losses = []
+    
+    for iter_ in range(args.num_training_steps_per_iter):
+        support_loss, supprt_pred = lstm_forward(
+            encoder,
+            decoder,
+            encoder_copy_params,
+            decoder_copy_params,
+            support_input_seq,
+            support_obs_seq,
+            args.obs_len,
+            rollout_len,
+            criterion,
+            model_utils
+        )
+
+        total_losses.append(per_step_loss_importance_vecor[iter_] * support_loss)
+
+        encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
+            support_loss, 
+            encoder, decoder,
+            encoder_copy_params, decoder_copy_params,
+            args.second_order,
+            encoder_learning_rule, decoder_learning_rule,
+            iter_,
+        )
+
+        if(iter_ == args.num_training_steps_per_iter - 1):
+            train_loss, train_preds = lstm_forward(
+                encoder,
+                decoder,
+                encoder_copy_params,
+                decoder_copy_params,
+                train_input_seq,
+                train_obs_seq,
+                args.obs_len,
+                rollout_len,
+                criterion,
+                model_utils
+            ) 
+            total_losses.append(train_loss)
+
+    #loss = train_loss
+    loss = torch.sum(torch.stack(total_losses)).to(device)
+    return loss
+
 def train_maml_oversimplified(
         train_loader: Any,
         epoch: int,
@@ -945,10 +1125,13 @@ def train_maml_oversimplified(
         logger: Logger,
         encoder: Any,
         decoder: Any,
-        encoder_optimizer: Any,
-        decoder_optimizer: Any,
+        encoder_optimizers: Any,
+        decoder_optimizers: Any,
         model_utils: ModelUtils,
+        loader_len,
         rollout_len: int = 30,
+        encoder_learning_rule = None,
+        decoder_learning_rule = None,
 ) -> None:
     """Train the lstm network.
 
@@ -967,89 +1150,173 @@ def train_maml_oversimplified(
     """
     args = parse_arguments()
     global global_step
-    encoder.zero_grad()
-    decoder.zero_grad()
-    encoder.train()
-    decoder.train()
-    import pdb; pdb.set_trace();
-    for i, (support_input_seqs, support_obs_seqs, train_input_seq, train_obs_seq, helpers) in enumerate(train_loader):
-        train_input_seq = train_input_seq.squeeze(1).to(device)
-        train_obs_seq = train_obs_seq.squeeze(1).to(device)
+    #import pdb; pdb.set_trace();
+    (encoder_optimizer, encoder_scheduler) = encoder_optimizers
+    (decoder_optimizer, decoder_scheduler) = decoder_optimizers
+    
+    per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch)
+            
+    with tqdm(total=loader_len, desc='Epoch: {}'.format(epoch), position=0) as pbar:
+        for i, data_batch in enumerate(train_loader):
+            encoder.train()
+            decoder.train()
+            zero_grad(encoder)
+            zero_grad(decoder)
+            pbar.update(1)
 
-            # Copy the model for MAML inner loop
-        shot = args.shot if args.shot <= args.train_batch_size else args.train_batch_size
-        support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
-        support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
-
-        encoder_copy_params = get_named_params_dicts(encoder)
-        decoder_copy_params = get_named_params_dicts(decoder)
-
-        train_loss = None
-        encoder_dict = get_named_params_dicts(encoder)
-        decoder_dict = get_named_params_dicts(decoder)
-       
-        for iter in range(args.num_training_steps_per_iter):
-            support_loss, supprt_pred = lstm_forward(
+            loss = maml_forward(
+                args,
+                data_batch,
+                epoch,
+                criterion,
                 encoder,
                 decoder,
-                encoder_copy_params,
-                decoder_copy_params,
-                support_input_seq,
-                support_obs_seq,
-                args.obs_len,
+                model_utils,
+                per_step_loss_importance_vecor,
+                args.second_order,
                 rollout_len,
-                criterion,
-                model_utils
+                encoder_learning_rule,
+                decoder_learning_rule,
+            )
+            encoder_optimizer.zero_grad()
+            decoder_optimizer.zero_grad()
+
+            # Backpropagate
+            loss.backward()
+            plot_grad_flow(encoder.named_parameters(), decoder.named_parameters())
+
+            clamp_grads(encoder)
+            clamp_grads(decoder)
+
+            encoder_optimizer.step()
+            decoder_optimizer.step()
+
+            encoder_scheduler.step(epoch=epoch)
+            decoder_scheduler.step(epoch=epoch)
+
+            #if i % 100 == 0:
+            #print(
+            #    f"Train -- Optimizer loop:{i} Epoch:{epoch}, avg loss:{loss}, Rollout:{rollout_len}")
+            if i % 100 == 0:
+                pbar.write(f"Train -- Optimizer loop:{i} Epoch:{epoch}, avg loss:{loss}, Rollout:{rollout_len}")
+            if global_step % 1000 == 0:
+
+                # Log results
+                #print(
+                #    f"Train -- Epoch:{epoch}, avg loss:{loss}, Rollout:{rollout_len}")
+
+                logger.scalar_summary(tag="Train/loss",
+                                      value=loss.item(),
+                                      step=epoch)
+
+            global_step += 1
+
+def validate_maml(
+        val_loader: Any,
+        epoch: int,
+        criterion: Any,
+        logger: Logger,
+        encoder: Any,
+        decoder: Any,
+        encoder_optimizer: Any,
+        decoder_optimizer: Any,
+        model_utils: ModelUtils,
+        loader_len,
+        prev_loss: float,
+        decrement_counter: int,
+        rollout_len: int = 30,
+        encoder_learning_rule = None,
+        decoder_learning_rule = None,
+) -> Tuple[float, int]:
+    """Validate the lstm network.
+
+    Args:
+        val_loader: DataLoader for the train set
+        epoch: epoch number
+        criterion: Loss criterion
+        logger: Tensorboard logger
+        encoder: Encoder network instance
+        decoder: Decoder network instance
+        encoder_optimizer: optimizer for the encoder network
+        decoder_optimizer: optimizer for the decoder network
+        model_utils: instance for ModelUtils class
+        prev_loss: Loss in the previous validation run
+        decrement_counter: keeping track of the number of consecutive times loss increased in the current rollout
+        rollout_len: current prediction horizon
+
+    """
+    args = parse_arguments()
+    global best_loss
+    total_loss = []
+
+    per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch)
+
+    with tqdm(total=loader_len, desc='Epoch: {}'.format(epoch), position=0) as pbar:
+        for i, data_batch in enumerate(val_loader):
+            encoder.eval()
+            decoder.eval()
+            pbar.update(1)
+
+            loss = 0
+            
+            loss = maml_forward(
+                args = args,
+                data_batch = data_batch,
+                epoch = epoch,
+                criterion = criterion,
+                encoder = encoder,
+                decoder = decoder,
+                model_utils = model_utils,
+                per_step_loss_importance_vecor = per_step_loss_importance_vecor,
+                second_order = False,
+                rollout_len = rollout_len,
+                encoder_learning_rule = encoder_learning_rule,
+                decoder_learning_rule = decoder_learning_rule,
             )
 
-            encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
-                support_loss, encoder, decoder, encoder_copy_params, decoder_copy_params, args.second_order
-            )
+            total_loss.append(loss)
 
-            if(iter == args.num_training_steps_per_iter - 1):
-                train_loss, train_preds = lstm_forward(
-                    encoder,
-                    decoder,
-                    encoder_copy_params,
-                    decoder_copy_params,
-                    train_input_seq,
-                    train_obs_seq,
-                    args.obs_len,
-                    rollout_len,
-                    criterion,
-                    model_utils
-                ) 
+            if i % 10 == 0:
 
+                pbar.write(
+                    f"Val -- Epoch:{epoch}, loss:{loss}, Rollout: {rollout_len}",
+                )
 
-        # Zero the gradients
-        encoder_optimizer.zero_grad()
-        decoder_optimizer.zero_grad()
+    # Save
+    val_loss = sum(total_loss) / len(total_loss)
 
-        loss = train_loss
+    if val_loss <= best_loss:
+        best_loss = val_loss
+        if args.use_map:
+            save_dir = "saved_models/lstm_map"
+        elif args.use_social:
+            save_dir = "saved_models/lstm_social"
+        else:
+            save_dir = "saved_models/lstm"
 
-        # Backpropagate
-        loss.backward()
-        clamp_grads(encoder)
-        clamp_grads(decoder)
+        os.makedirs(save_dir, exist_ok=True)
+        model_utils.save_checkpoint(
+            save_dir,
+            {
+                "epoch": epoch + 1,
+                "rollout_len": rollout_len,
+                "encoder_state_dict": encoder.state_dict(),
+                "decoder_state_dict": decoder.state_dict(),
+                "best_loss": val_loss,
+                "encoder_optimizer": encoder_optimizer.state_dict(),
+                "decoder_optimizer": decoder_optimizer.state_dict(),
+            },
+        )
 
-        encoder_optimizer.step()
-        decoder_optimizer.step()
-        #if i % 100 == 0:
-        print(
-            f"Train -- Optimizer loop:{i} Epoch:{epoch}, avg loss:{loss}, Rollout:{rollout_len}")
+    logger.scalar_summary(tag="Val/loss", value=val_loss.item(), step=epoch)
 
-        if global_step % 1000 == 0:
+    # Keep track of the loss to change preiction horizon
+    if val_loss <= prev_loss:
+        decrement_counter = 0
+    else:
+        decrement_counter += 1
 
-            # Log results
-            print(
-                f"Train -- Epoch:{epoch}, avg loss:{loss}, Rollout:{rollout_len}")
-
-            logger.scalar_summary(tag="Train/loss",
-                                  value=loss.item(),
-                                  step=epoch)
-
-        global_step += 1
-
+    return val_loss, decrement_counter
 
 def validate(
         val_loader: Any,
@@ -1480,8 +1747,14 @@ def main():
     encoder.to(device)
     decoder.to(device)
 
-    encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
-    decoder_optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
+    encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr, amsgrad=False)
+    decoder_optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr, amsgrad=False)
+    encoder_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=encoder_optimizer, T_max=args.end_epoch,
+                                                              eta_min=args.min_lr)
+    decoder_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=decoder_optimizer, T_max=args.end_epoch,
+                                                              eta_min=args.min_lr)
+    encoder_optimizers = (encoder_optimizer, encoder_scheduler)
+    decoder_optimizers = (decoder_optimizer, decoder_scheduler)
 
     # If model_path provided, resume from saved checkpoint
     if args.model_path is not None and os.path.isfile(args.model_path):
@@ -1502,12 +1775,14 @@ def main():
 
         # Get PyTorch Dataset
         train_dataset = None
+        val_dataset = None
         if args.maml: 
             seed = 0 # np.random.randint(10)
             train_dataset = LSTMDataset_maml_simplified(data_dict, args, "train", seed)
+            val_dataset = LSTMDataset_maml_simplified(data_dict, args, "val", seed)
         else:
             train_dataset = LSTMDataset(data_dict, args, "train")
-        val_dataset = LSTMDataset(data_dict, args, "val")
+            val_dataset = LSTMDataset(data_dict, args, "val")
 
         # Setting Dataloaders
         train_loader = torch.utils.data.DataLoader(
@@ -1522,10 +1797,25 @@ def main():
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=args.val_batch_size,
+            num_workers=8,
             drop_last=False,
             shuffle=False,
-            collate_fn=model_utils.my_collate_fn,
+            collate_fn=model_utils.my_collate_fn_maml if args.maml else model_utils.my_collate_fn,
         )
+
+        if args.use_lslr:
+            encoder_learning_rule = baseline_utils.LSLRGradientDescentLearningRule(
+                device, args.num_training_steps_per_iter, args.use_learnable_lr, 1e-3,
+            )
+            decoder_learning_rule = baseline_utils.LSLRGradientDescentLearningRule(
+                device, args.num_training_steps_per_iter, args.use_learnable_lr, 1e-3,
+            )
+            encoder_learning_rule.initialise(get_named_params_dicts(encoder))
+            decoder_learning_rule.initialise(get_named_params_dicts(decoder))
+        else:
+            encoder_learning_rule = None
+            decoder_learning_rule = None
+
 
         print("Training begins ...")
 
@@ -1534,6 +1824,8 @@ def main():
         #import pdb; pdb.set_trace();
         epoch = start_epoch
         global_start_time = time.time()
+        train_loader_len = len(iter(train_loader))
+        val_loader_len = len(iter(val_loader))
         for i in range(start_rollout_idx, len(ROLLOUT_LENS)):
             rollout_len = ROLLOUT_LENS[i]
             logger = Logger(log_dir, name="{}".format(rollout_len))
@@ -1549,10 +1841,13 @@ def main():
                         logger,
                         encoder,
                         decoder,
-                        encoder_optimizer,
-                        decoder_optimizer,
+                        encoder_optimizers,
+                        decoder_optimizers,
                         model_utils,
+                        train_loader_len,
                         rollout_len,
+                        encoder_learning_rule,
+                        decoder_learning_rule,
                     )
                 else:
                     train(
@@ -1576,20 +1871,41 @@ def main():
                 epoch += 1
                 if epoch % 5 == 0:
                     start = time.time()
-                    prev_loss, decrement_counter = validate(
-                        val_loader,
-                        epoch,
-                        criterion,
-                        logger,
-                        encoder,
-                        decoder,
-                        encoder_optimizer,
-                        decoder_optimizer,
-                        model_utils,
-                        prev_loss,
-                        decrement_counter,
-                        rollout_len,
-                    )
+                    if args.maml:
+                        #import pdb; pdb.set_trace();
+                        prev_loss, decrement_counter = validate_maml(
+                            val_loader,
+                            epoch,
+                            criterion,
+                            logger,
+                            encoder,
+                            decoder,
+                            encoder_optimizers,
+                            decoder_optimizers,
+                            model_utils,
+                            val_loader_len,
+                            prev_loss,
+                            decrement_counter,
+                            rollout_len,
+                            encoder_learning_rule,
+                            decoder_learning_rule,
+                        )
+
+                    else:
+                        prev_loss, decrement_counter = validate(
+                            val_loader,
+                            epoch,
+                            criterion,
+                            logger,
+                            encoder,
+                            decoder,
+                            encoder_optimizer,
+                            decoder_optimizer,
+                            model_utils,
+                            prev_loss,
+                            decrement_counter,
+                            rollout_len,
+                        )
                     end = time.time()
                     print(
                         f"Validation completed in {(end - start) / 60.0} mins, Total time: {(end - global_start_time) / 60.0} mins"

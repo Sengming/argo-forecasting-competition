@@ -15,6 +15,9 @@ import pandas as pd
 from shapely.geometry import Point, Polygon, LineString, LinearRing
 from shapely.affinity import affine_transform, rotate
 
+import torch
+import torch.nn as nn
+
 from utils.baseline_config import (
     BASELINE_INPUT_FEATURES,
     BASELINE_OUTPUT_FEATURES,
@@ -745,3 +748,62 @@ def validate_args(args: Any) -> bool:
         print("[ARGS ERROR]: pred_len cannot be more than 30.")
         success = False
     return success
+
+class LSLRGradientDescentLearningRule(nn.Module):
+    """Simple (stochastic) gradient descent learning rule.
+    For a scalar error function `E(p[0], p_[1] ... )` of some set of
+    potentially multidimensional parameters this attempts to find a local
+    minimum of the loss function by applying updates to each parameter of the
+    form
+        p[i] := p[i] - learning_rate * dE/dp[i]
+    With `learning_rate` a positive scaling parameter.
+    The error function used in successive applications of these updates may be
+    a stochastic estimator of the true error function (e.g. when the error with
+    respect to only a subset of data-points is calculated) in which case this
+    will correspond to a stochastic gradient descent learning rule.
+    """
+
+    def __init__(self, device, total_num_inner_loop_steps, use_learnable_learning_rates, init_learning_rate=1e-3):
+        """Creates a new learning rule object.
+        Args:
+            init_learning_rate: A postive scalar to scale gradient updates to the
+                parameters by. This needs to be carefully set - if too large
+                the learning dynamic will be unstable and may diverge, while
+                if set too small learning will proceed very slowly.
+        """
+        super(LSLRGradientDescentLearningRule, self).__init__()
+        print(init_learning_rate)
+        assert init_learning_rate > 0., 'learning_rate should be positive.'
+        self.device = device
+
+        self.init_learning_rate = torch.ones(1) * init_learning_rate
+        self.init_learning_rate =  self.init_learning_rate.type(torch.FloatTensor)
+        self.init_learning_rate.to(device)
+        self.total_num_inner_loop_steps = total_num_inner_loop_steps
+        self.use_learnable_learning_rates = use_learnable_learning_rates
+
+    def initialise(self, names_weights_dict):
+        self.names_learning_rates_dict = nn.ParameterDict()
+        for idx, (key, param) in enumerate(names_weights_dict.items()):
+            self.names_learning_rates_dict[key.replace(".", "-")] = nn.Parameter(
+                data=(torch.ones(self.total_num_inner_loop_steps + 1) * self.init_learning_rate).to(self.device),
+                requires_grad=self.use_learnable_learning_rates)
+
+    def reset(self):
+
+        # for key, param in self.names_learning_rates_dict.items():
+        #     param.fill_(self.init_learning_rate)
+        pass
+
+    def update_params(
+        self,
+        param_dict,
+        grad_dict,
+        step,
+    ):
+        updated_weights_dict = dict()
+        for key in grad_dict.keys():
+            updated_weights_dict[key] = param_dict[key] - \
+                 self.names_learning_rates_dict[key.replace(".", "-")][step] * grad_dict[key]
+    
+        return updated_weights_dict

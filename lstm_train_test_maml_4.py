@@ -32,6 +32,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from torchviz import make_dot
+from pympler import muppy, summary
 
 from logger import Logger
 import utils.baseline_config as config
@@ -181,6 +182,10 @@ def parse_arguments() -> Any:
                          type=float,
                          default=.001,
                          help="Number of CPU threads used for the dataloader")
+    parser.add_argument("--num_layers",
+                         type=int,
+                         default=1,
+                         help="Number of CPU threads used for the dataloader")
 
     return parser.parse_args()
 
@@ -200,10 +205,10 @@ class MetaLinearLayer(nn.Module):
         c = input_size
 
         self.use_bias = use_bias
-        self.weights = nn.Parameter(torch.ones(num_filters, c))
+        self.weights = nn.Parameter(torch.ones(num_filters, c), requires_grad=True)
         nn.init.xavier_uniform_(self.weights)
         if self.use_bias:
-            self.bias = nn.Parameter(torch.zeros(num_filters))
+            self.bias = nn.Parameter(torch.zeros(num_filters), requires_grad=True)
 
     def forward(self, x, params=None):
         """
@@ -285,12 +290,20 @@ class MetaLSTMCell(nn.Module):
         c = torch.zeros_like(input_.view(1, input_.size(1), -1))
         return h, c
 
+def create_init_params(num_layers, batch_size, hidden_size, model_utils):
+    init_params = dict()
+    for i in range(1, num_layers+1):
+        init_params['lstm{}'.format(i)] = model_utils.init_hidden(batch_size,hidden_size)
+    return init_params
+
 class MetaEncoderRNN(nn.Module):
     """Encoder Network."""
     def __init__(self,
                  input_size: int = 2,
                  embedding_size: int = 8,
-                 hidden_size: int = 16):
+                 hidden_size: int = 16,
+                 num_layers: int = 1
+                 ):
         """Initialize the encoder network.
 
         Args:
@@ -301,11 +314,18 @@ class MetaEncoderRNN(nn.Module):
         """
         super(MetaEncoderRNN, self).__init__()
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        self.enclinear1 = MetaLinearLayer(input_size, embedding_size, use_bias=True)
+        self.enclstms = nn.ModuleDict()
+        self.enclstms['lstm1'] = MetaLSTMCell(embedding_size, hidden_size)
 
-        self.linear1 = MetaLinearLayer(input_size, embedding_size, use_bias=True)
-        self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
+        for i in range(1, self.num_layers):
+            self.enclstms['lstm{}'.format(i+1)] = MetaLSTMCell(hidden_size, hidden_size)
 
-    def forward(self, x: torch.FloatTensor, hidden, param=None):
+        #self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
+
+    def forward(self, x: torch.FloatTensor, hidden_in, param=None):
         """Run forward propagation.
 
         Args:
@@ -316,31 +336,44 @@ class MetaEncoderRNN(nn.Module):
 
         """
         param_dict = None if param == None else self.preprocess_param_dict(param)
-        embedded = F.relu(self.linear1(x, (None if param == None else param_dict['linear1'])))
-        hidden = self.lstm1(embedded, hidden, (None if param == None else param_dict['lstm1']))
-        return hidden
+        #embedded = F.relu(self.enclinear1(x, (None if param == None else param_dict['enclinear1'])))
+        #hidden = self.lstm['lstm1'](embedded, hidden, (None if param == None else param_dict['lstm1']))
+        embedded = F.leaky_relu(self.enclinear1(x, (None if param == None else param_dict['enclinear1'])))
+        hidden_out = dict()
+        #import pdb; pdb.set_trace();
+        hidden_out['lstm1'] = self.enclstms['lstm1'](embedded, hidden_in['lstm1'], (None if param == None else param_dict['lstm1']))
+
+        for i in range(1, self.num_layers):
+            key = 'lstm{}'.format(i+1)
+            prev_key = 'lstm{}'.format(i)
+            hidden_out[key] = self.enclstms[key](hidden_out[prev_key][0], hidden_in[key], (None if param == None else param_dict[key]))
+
+        return hidden_out
     
     def preprocess_param_dict(self, param_dict):
         reordered_dict = {}
-        reordered_dict['linear1'] = {}
-        reordered_dict['lstm1'] ={}
-        reordered_dict['lstm1']['i2h'] ={}
-        reordered_dict['lstm1']['h2h'] ={}
+        reordered_dict['enclinear1'] = {}
+        for i in range(1, self.num_layers+1):
+            reordered_dict['lstm{}'.format(i)] = {}
+            reordered_dict['lstm{}'.format(i)]['i2h'] ={}
+            reordered_dict['lstm{}'.format(i)]['h2h'] ={}
         for name, param in param_dict.items():
             key = (name.replace('module.', '')) if 'module.' in name else name
             names_split = key.split('.')
-            if names_split[0] == 'linear1':
-                reordered_dict['linear1'][names_split[1]] = param
-            elif names_split[0] == 'lstm1':
-                if names_split[1] == 'i2h':
-                    reordered_dict['lstm1']['i2h'][names_split[2]] = param
-                elif names_split[1] == 'h2h':
-                    reordered_dict['lstm1']['h2h'][names_split[2]] = param
+            if names_split[0] == 'enclinear1':
+                reordered_dict['enclinear1'][names_split[1]] = param
+            elif names_split[0] == 'enclstms':
+                reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
         return reordered_dict
 
 class MetaDecoderRNN(nn.Module):
     """Encoder Network."""
-    def __init__(self, embedding_size=8, hidden_size=16, output_size=2):
+    def __init__(self,
+                 embedding_size=8,
+                 hidden_size=16,
+                 output_size=2,
+                 num_layers = 1,
+                 ):
 
         """Args:
             embedding_size: Embedding size
@@ -349,12 +382,19 @@ class MetaDecoderRNN(nn.Module):
         """
         super(MetaDecoderRNN, self).__init__()
         self.hidden_size = hidden_size
+        self.num_layers = num_layers 
 
-        self.linear1 = MetaLinearLayer(output_size, embedding_size, use_bias=True)
-        self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
-        self.linear2 = MetaLinearLayer(hidden_size, output_size, use_bias=True)
+        self.declinear1 = MetaLinearLayer(output_size, embedding_size, use_bias=True)
+        #self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
+        self.declstms = nn.ModuleDict()
+        self.declstms['lstm1'] = MetaLSTMCell(embedding_size, hidden_size)
 
-    def forward(self, x: torch.FloatTensor, hidden, param=None):
+        for i in range(1, self.num_layers):
+            self.declstms['lstm{}'.format(i+1)] = MetaLSTMCell(hidden_size, hidden_size)
+
+        self.declinear2 = MetaLinearLayer(hidden_size, output_size, use_bias=True)
+
+    def forward(self, x: torch.FloatTensor, hidden_in, param=None):
         """Run forward propagation.
 
         Args:
@@ -364,33 +404,40 @@ class MetaDecoderRNN(nn.Module):
             hidden: final hidden 
 
         """
+        #import pdb; pdb.set_trace()
         param_dict = None if param == None else self.preprocess_param_dict(param)
-        embedded = F.relu(self.linear1(x, (None if param == None else param_dict['linear1'])))
-        hidden = self.lstm1(embedded, hidden, (None if param == None else param_dict['lstm1']))
-        output = self.linear2(hidden[0], (None if param == None else param_dict['linear2']))
-        return output, hidden
+        embedded = F.leaky_relu(self.declinear1(x, (None if param == None else param_dict['declinear1'])))
+
+        #hidden = self.lstm1(embedded, hidden, (None if param == None else param_dict['lstm1']))
+        hidden_out = dict()
+        hidden_out['lstm1'] = self.declstms['lstm1'](embedded, hidden_in['lstm1'], (None if param == None else param_dict['lstm1']))
+
+        for i in range(1, self.num_layers):
+            key = 'lstm{}'.format(i+1)
+            prev_key = 'lstm{}'.format(i)
+            hidden_out[key] = self.declstms[key](hidden_out[prev_key][0], hidden_in[key], (None if param == None else param_dict[key]))
+
+        output = self.declinear2(hidden_out['lstm{}'.format(self.num_layers)][0], (None if param == None else param_dict['declinear2']))
+        return output, hidden_out
     
     def preprocess_param_dict(self, param_dict):
         reordered_dict = {}
-        reordered_dict['linear1'] = {}
-        reordered_dict['linear2'] = {}
-        reordered_dict['lstm1'] ={}
-        reordered_dict['lstm1']['i2h'] ={}
-        reordered_dict['lstm1']['h2h'] ={}
+        reordered_dict['declinear1'] = {}
+        reordered_dict['declinear2'] = {}
+        for i in range(1, self.num_layers+1):
+            reordered_dict['lstm{}'.format(i)] = {}
+            reordered_dict['lstm{}'.format(i)]['i2h'] ={}
+            reordered_dict['lstm{}'.format(i)]['h2h'] ={}
         for name, param in param_dict.items():
             key = (name.replace('module.', '')) if 'module.' in name else name
             names_split = key.split('.')
-            if names_split[0] == 'linear1':
-                reordered_dict['linear1'][names_split[1]] = param
-            elif names_split[0] == 'lstm1':
-                if names_split[1] == 'i2h':
-                    reordered_dict['lstm1']['i2h'][names_split[2]] = param
-                elif names_split[1] == 'h2h':
-                    reordered_dict['lstm1']['h2h'][names_split[2]] = param
-            elif names_split[0] == 'linear2':
-                reordered_dict['linear2'][names_split[1]] = param
+            if names_split[0] == 'declinear1':
+                reordered_dict['declinear1'][names_split[1]] = param
+            elif names_split[0] == 'declstms':
+                reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
+            elif names_split[0] == 'declinear2':
+                reordered_dict['declinear2'][names_split[1]] = param
         return reordered_dict
-  
 
 class EncoderRNN(nn.Module):
     """Encoder Network."""
@@ -553,6 +600,7 @@ def train(
         loss = 0
 
         # Encode observed trajectory
+        #import pdb; pdb.set_trace();
         for ei in range(input_length):
             encoder_input = _input[:, ei, :]
             encoder_hidden = encoder(encoder_input, encoder_hidden)
@@ -598,6 +646,7 @@ def train(
         global_step += 1
 
 def lstm_forward(
+    num_layers,
     encoder: Any,
     decoder: Any,
     encoder_params: Any,
@@ -614,13 +663,17 @@ def lstm_forward(
     loss = 0
 
     # Initialize encoder hidden state
-    encoder_hidden = model_utils.init_hidden(
-        batch_size,
-        encoder.module.hidden_size if use_cuda else encoder.hidden_size)
+    #encoder_hidden = model_utils.init_hidden(
+    #    batch_size,
+    #    encoder.module.hidden_size if use_cuda else encoder.hidden_size)
+    encoder_hidden = create_init_params(num_layers,
+                                        batch_size,
+                                        encoder.module.hidden_size if use_cuda else encoder.hidden_size,
+                                        model_utils,)
 
 
+    #import pdb; pdb.set_trace()
     # Encode observed trajectory
-    import pdb; pdb.set_trace();
     for ei in range(obs_len):
         encoder_input = input_seq[:, ei, :]
         encoder_hidden = encoder(encoder_input, encoder_hidden, encoder_params)
@@ -705,6 +758,7 @@ def maml_inner_loop_update(
     decoder_learning_rule = None,
     step = 0,
 ):
+    #import pdb; pdb.set_trace();
     zero_grad(encoder, encoder_params)
     zero_grad(decoder, decoder_params)
 
@@ -835,6 +889,7 @@ def train_maml(
        
             for iter in range(args.num_training_steps_per_iter):
                 support_loss, supprt_pred = lstm_forward(
+                    args.num_layers,
                     encoder,
                     decoder,
                     encoder_copy_params,
@@ -853,6 +908,7 @@ def train_maml(
 
                 if(iter == args.num_training_steps_per_iter - 1):
                     train_loss, train_preds = lstm_forward(
+                        args.num_layers,
                         encoder,
                         decoder,
                         encoder_copy_params,
@@ -971,6 +1027,7 @@ def train_maml_simplified(
 
             for iter in range(args.num_training_steps_per_iter):
                 support_loss, supprt_pred = lstm_forward(
+                    args.num_layers,
                     encoder,
                     decoder,
                     encoder_copy_params,
@@ -991,6 +1048,7 @@ def train_maml_simplified(
 
                 if(iter == args.num_training_steps_per_iter - 1):
                     train_loss, train_preds = lstm_forward(
+                        args.num_layers,
                         encoder,
                         decoder,
                         encoder_copy_params,
@@ -1061,11 +1119,13 @@ def maml_forward(
 
     train_input_seq = train_input_seq.squeeze(1).to(device)
     train_obs_seq = train_obs_seq.squeeze(1).to(device)
+    support_input_seqs = support_input_seqs.to(device)
+    support_obs_seqs = support_obs_seqs.to(device)
 
         # Copy the model for MAML inner loop
     shot = args.shot if args.shot <= args.train_batch_size else args.train_batch_size
-    support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
-    support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
+    support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1)
+    support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1)
 
     encoder_copy_params = get_named_params_dicts(encoder)
     decoder_copy_params = get_named_params_dicts(decoder)
@@ -1078,6 +1138,7 @@ def maml_forward(
     
     for iter_ in range(args.num_training_steps_per_iter):
         support_loss, supprt_pred = lstm_forward(
+            args.num_layers,
             encoder,
             decoder,
             encoder_copy_params,
@@ -1103,6 +1164,7 @@ def maml_forward(
 
         if(iter_ == args.num_training_steps_per_iter - 1):
             train_loss, train_preds = lstm_forward(
+                args.num_layers,
                 encoder,
                 decoder,
                 encoder_copy_params,
@@ -1115,6 +1177,10 @@ def maml_forward(
                 model_utils
             ) 
             total_losses.append(train_loss)
+
+            all_objects = muppy.get_objects()
+            sum1 = summary.summarize(all_objects)
+            summary.print_(sum1)
 
     #loss = train_loss
     loss = torch.sum(torch.stack(total_losses)).to(device)
@@ -1185,7 +1251,7 @@ def train_maml_oversimplified(
 
             # Backpropagate
             loss.backward()
-            plot_grad_flow(encoder.named_parameters(), decoder.named_parameters())
+            #plot_grad_flow(encoder.named_parameters(), decoder.named_parameters())
 
             clamp_grads(encoder)
             clamp_grads(decoder)
@@ -1312,8 +1378,6 @@ def validate_maml(
                 "decoder_optimizer": decoder_optimizer.state_dict(),
                 "encoder_learning_rate": encoder_scheduler.get_lr(),
                 "decoder_learning_rate": decoder_scheduler.get_lr(),
-                "encoder_learning_rule_lr": encoder_learning_rule.get_lr_dict(),
-                "decoder_learning_rule_lr": encoder_learning_rule.get_lr_dict(),
             },
         )
 
@@ -1744,8 +1808,8 @@ def main():
     criterion = nn.MSELoss()
     if args.maml:
         encoder = MetaEncoderRNN(
-            input_size=len(baseline_utils.BASELINE_INPUT_FEATURES[baseline_key]))
-        decoder = MetaDecoderRNN(output_size=2)
+            input_size=len(baseline_utils.BASELINE_INPUT_FEATURES[baseline_key]), num_layers=args.num_layers)
+        decoder = MetaDecoderRNN(output_size=2, num_layers=args.num_layers)
     else:
         encoder = EncoderRNN(
             input_size=len(baseline_utils.BASELINE_INPUT_FEATURES[baseline_key]))
@@ -1923,6 +1987,7 @@ def main():
                     # If val loss increased 3 times consecutively, go to next rollout length
                     if decrement_counter > 2:
                         break
+        #import pdb; pdb.set_trace();
 
     else:
 

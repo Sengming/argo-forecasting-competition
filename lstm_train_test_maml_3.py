@@ -198,12 +198,11 @@ class MetaLinearLayer(nn.Module):
         super(MetaLinearLayer, self).__init__()
         c = input_size
 
-        import pdb; pdb.set_trace();
         self.use_bias = use_bias
-        self.weights = nn.Parameter(torch.ones(num_filters, c)).to(device)
+        self.weights = nn.Parameter(torch.ones(num_filters, c))
         nn.init.xavier_uniform_(self.weights)
         if self.use_bias:
-            self.bias = nn.Parameter(torch.zeros(num_filters)).to_device()
+            self.bias = nn.Parameter(torch.zeros(num_filters))
 
     def forward(self, x, params=None):
         """
@@ -1159,7 +1158,6 @@ def train_maml_oversimplified(
             
     with tqdm(total=loader_len, desc='Epoch: {}'.format(epoch), position=0) as pbar:
         for i, data_batch in enumerate(train_loader):
-            import pdb; pdb.set_trace();
             encoder.train()
             decoder.train()
             zero_grad(encoder)
@@ -1313,7 +1311,7 @@ def validate_maml(
                 "encoder_learning_rate": encoder_scheduler.get_lr(),
                 "decoder_learning_rate": decoder_scheduler.get_lr(),
                 "encoder_learning_rule_lr": encoder_learning_rule.get_lr_dict(),
-                "decoder_learning_rule_lr": decoder_learning_rule.get_lr_dict(),
+                "decoder_learning_rule_lr": encoder_learning_rule.get_lr_dict(),
             },
         )
 

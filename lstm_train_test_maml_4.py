@@ -860,8 +860,8 @@ def maml_forward(
 
         # Copy the model for MAML inner loop
     shot = args.shot if args.shot <= args.train_batch_size else args.train_batch_size
-    support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1).to_device()
-    support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1).to_device()
+    support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
+    support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
 
     encoder_copy_params = get_named_params_dicts(encoder)
     decoder_copy_params = get_named_params_dicts(decoder)

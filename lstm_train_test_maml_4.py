@@ -1109,6 +1109,32 @@ def validate_maml(
             },
         )
 
+    # Save all models too for good measure
+    if args.use_map:
+        save_dir = "saved_models/lstm_map/all"
+    elif args.use_social:
+        save_dir = "saved_models/lstm_social/all"
+    else:
+        save_dir = "saved_models/lstm/all"
+
+    os.makedirs(save_dir, exist_ok=True)
+    model_utils.save_checkpoint(
+        save_dir,
+        {
+            "epoch": epoch + 1,
+            "rollout_len": rollout_len,
+            "encoder_state_dict": encoder.state_dict(),
+            "decoder_state_dict": decoder.state_dict(),
+            "best_loss": val_loss,
+            "encoder_optimizer": encoder_optimizer.state_dict(),
+            "decoder_optimizer": decoder_optimizer.state_dict(),
+            "encoder_learning_rate": encoder_scheduler.get_lr(),
+            "decoder_learning_rate": decoder_scheduler.get_lr(),
+            "encoder_learning_rule_dict":encoder_learning_rule.get_lr_dict(),
+            "decoder_learning_rule_dict":decoder_learning_rule.get_lr_dict(),
+        },
+    )
+
     logger.scalar_summary(tag="Val/loss", value=val_loss, step=epoch)
 
     # Keep track of the loss to change preiction horizon

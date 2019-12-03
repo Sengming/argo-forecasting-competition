@@ -1085,11 +1085,11 @@ def validate_maml(
     if val_loss <= best_loss:
         best_loss = val_loss
         if args.use_map:
-            save_dir = "saved_models/lstm_map"
+            save_dir = "saved_models/lstm_map/best_val"
         elif args.use_social:
-            save_dir = "saved_models/lstm_social"
+            save_dir = "saved_models/lstm_social/best_val"
         else:
-            save_dir = "saved_models/lstm"
+            save_dir = "saved_models/lstm/best_val"
 
         os.makedirs(save_dir, exist_ok=True)
         model_utils.save_checkpoint(

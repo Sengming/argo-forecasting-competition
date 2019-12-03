@@ -236,9 +236,7 @@ class MetaLinearLayer(nn.Module):
                 weight = self.weights
                 bias = None
         # print(x.shape)
-        out = F.linear(input=x, weight=weight, bias=bias)
-        return out
-
+        return F.linear(input=x, weight=weight, bias=bias)
 
 class MetaLSTMCell(nn.Module):
 
@@ -662,10 +660,6 @@ def lstm_forward(
     # Initialize losses
     loss = 0
 
-    # Initialize encoder hidden state
-    #encoder_hidden = model_utils.init_hidden(
-    #    batch_size,
-    #    encoder.module.hidden_size if use_cuda else encoder.hidden_size)
     encoder_hidden = create_init_params(num_layers,
                                         batch_size,
                                         encoder.module.hidden_size if use_cuda else encoder.hidden_size,
@@ -757,13 +751,22 @@ def maml_inner_loop_update(
     encoder_learning_rule = None,
     decoder_learning_rule = None,
     step = 0,
+    mamlpp = False,
 ):
     #import pdb; pdb.set_trace();
     zero_grad(encoder, encoder_params)
     zero_grad(decoder, decoder_params)
 
-    encoder_grads = torch.autograd.grad(loss, encoder_params.values(), create_graph=use_second_order)
-    decoder_grads = torch.autograd.grad(loss, decoder_params.values(), create_graph=use_second_order)
+    if mamlpp:
+        encoder_grads = torch.autograd.grad(loss, encoder_params.values(), retain_graph = True)
+        decoder_grads = torch.autograd.grad(loss, decoder_params.values(), retain_graph = True)
+        for grad in encoder_grads:
+            grad = grad.detach()
+        for grad in decoder_grads:
+            grad = grad.detach()
+    else:
+        encoder_grads = torch.autograd.grad(loss, encoder_params.values(), create_graph=use_second_order)
+        decoder_grads = torch.autograd.grad(loss, decoder_params.values(), create_graph=use_second_order)
 
     encoder_grads_wrt_param_names = dict(zip(encoder_params.keys(), encoder_grads))
     decoder_grads_wrt_param_names = dict(zip(decoder_params.keys(), decoder_grads))
@@ -833,271 +836,6 @@ def get_per_step_loss_importance_vector(args, current_epoch):
     loss_weights = torch.Tensor(loss_weights).to(device=device)
     return loss_weights
 
-def train_maml(
-        train_loader: Any,
-        epoch: int,
-        criterion: Any,
-        logger: Logger,
-        encoder: Any,
-        decoder: Any,
-        encoder_optimizer: Any,
-        decoder_optimizer: Any,
-        model_utils: ModelUtils,
-        rollout_len: int = 30,
-) -> None:
-    """Train the lstm network.
-
-    Args:
-        train_loader: DataLoader for the train set
-        epoch: epoch number
-        criterion: Loss criterion
-        logger: Tensorboard logger
-        encoder: Encoder network instance
-        decoder: Decoder network instance
-        encoder_optimizer: optimizer for the encoder network
-        decoder_optimizer: optimizer for the decoder network
-        model_utils: instance for ModelUtils class
-        rollout_len: current prediction horizon
-
-    """
-    args = parse_arguments()
-    global global_step
-    encoder.zero_grad()
-    decoder.zero_grad()
-    encoder.train()
-    decoder.train()
-    
-    for i, (support_input_seqs, support_obs_seqs, train_input_seqs, train_obs_seqs, helpers) in enumerate(train_loader):
-        support_input_seqs = support_input_seqs.to(device)
-        support_obs_seqs = support_obs_seqs.to(device)
-        train_input_seqs = train_input_seqs.to(device)
-        train_obs_seqs = train_obs_seqs.to(device)
-        
-        loss_list = []
-        for j, (support_input_seq, support_obs_seq, train_input_seq, train_obs_seq) in enumerate(
-                                                                                        zip(support_input_seqs,
-                                                                                            support_obs_seqs,
-                                                                                            train_input_seqs,
-                                                                                            train_obs_seqs)):
-            # Copy the model for MAML inner loop
-            encoder_copy_params = get_named_params_dicts(encoder)
-            decoder_copy_params = get_named_params_dicts(decoder)
-
-            train_loss = None
-            encoder_dict = get_named_params_dicts(encoder)
-            decoder_dict = get_named_params_dicts(decoder)
-       
-            for iter in range(args.num_training_steps_per_iter):
-                support_loss, supprt_pred = lstm_forward(
-                    args.num_layers,
-                    encoder,
-                    decoder,
-                    encoder_copy_params,
-                    decoder_copy_params,
-                    support_input_seq,
-                    support_obs_seq,
-                    args.obs_len,
-                    args.pred_len,
-                    criterion,
-                    model_utils
-                )
-
-                encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
-                    support_loss, encoder, decoder, encoder_copy_params, decoder_copy_params, args.second_order
-                )
-
-                if(iter == args.num_training_steps_per_iter - 1):
-                    train_loss, train_preds = lstm_forward(
-                        args.num_layers,
-                        encoder,
-                        decoder,
-                        encoder_copy_params,
-                        decoder_copy_params,
-                        train_input_seq,
-                        train_obs_seq,
-                        args.obs_len,
-                        args.pred_len,
-                        criterion,
-                        model_utils
-                    ) 
-
-
-            # Zero the gradients
-            encoder_optimizer.zero_grad()
-            decoder_optimizer.zero_grad()
-
-            loss = train_loss
-
-            if global_step % 1000 == 0:
-                loss_list.append(loss.item())
-
-            # Backpropagate
-            loss.backward()
-            clamp_grads(encoder)
-            clamp_grads(decoder)
-
-            encoder_optimizer.step()
-            decoder_optimizer.step()
-            if j % 100 == 0:
-                print(
-                    f"Training inner loop {j}-- Epoch:{epoch}, loss:{loss}, Rollout:{rollout_len}")
-
-        if global_step % 1000 == 0:
-
-            # Log results
-            avg_loss = np.array(loss_list).mean()
-            print(
-                f"--------------------------------------\n\
-                Train -- Epoch:{epoch}, avg loss:{avg_loss}, Rollout:{rollout_len}\n\
-                --------------------------------------")
-
-            logger.scalar_summary(tag="Train/loss",
-                                  value=avg_loss,
-                                  step=epoch)
-
-        global_step += 1
-
-def train_maml_simplified(
-        train_loader: Any,
-        epoch: int,
-        criterion: Any,
-        logger: Logger,
-        encoder: Any,
-        decoder: Any,
-        encoder_optimizer: Any,
-        decoder_optimizer: Any,
-        model_utils: ModelUtils,
-        rollout_len: int = 30,
-) -> None:
-    """Train the lstm network.
-
-    Args:
-        train_loader: DataLoader for the train set
-        epoch: epoch number
-        criterion: Loss criterion
-        logger: Tensorboard logger
-                        train_loader_len,
-        encoder: Encoder network instance
-        decoder: Decoder network instance
-        encoder_optimizer: optimizer for the encoder network
-        decoder_optimizer: optimizer for the decoder network
-        model_utils: instance for ModelUtils class
-        rollout_len: current prediction horizon
-
-    """
-    args = parse_arguments()
-    global global_step
-    encoder.zero_grad()
-    decoder.zero_grad()
-    encoder.train()
-    decoder.train()
-    #import pdb; pdb.set_trace();
-    for i, (support_input_seqs, support_obs_seqs, train_input_seqs, train_obs_seqs, helpers) in enumerate(train_loader):
-        #support_input_seqs = support_input_seqs.to(device)
-        #support_obs_seqs = support_obs_seqs.to(device)
-        #train_input_seqs = train_input_seqs.to(device)
-        #train_obs_seqs = train_obs_seqs.to(device)
-
-        maml_dataset = TensorDataset(support_input_seqs, support_obs_seqs, train_input_seqs, train_obs_seqs)
-        maml_dataloader = torch.utils.data.DataLoader(maml_dataset, batch_size = args.minibatch_size, num_workers = args.num_workers)
-        
-        loss_list = []
-        for j, (batch_support_input_seq, batch_support_obs_seq, train_input_seq, train_obs_seq) in enumerate(maml_dataloader):
-            # Copy the model for MAML inner loop
-            shot = args.shot if batch_support_input_seq.shape[0] >= args.shot else batch_support_input_seq.shape[0]
-            support_input_seq = batch_support_input_seq[:shot, :].squeeze(dim=1)
-            support_obs_seq = batch_support_obs_seq[:shot, :].squeeze(dim=1)
-
-            support_input_seq = support_input_seq.to(device)
-            support_obs_seq = support_obs_seq.to(device)
-            train_input_seq = train_input_seq.squeeze(dim=1).to(device)
-            train_obs_seq = train_obs_seq.squeeze(dim=1).to(device)
-
-
-            encoder_copy_params = get_named_params_dicts(encoder)
-            decoder_copy_params = get_named_params_dicts(decoder)
-
-            train_loss = None
-            encoder_dict = get_named_params_dicts(encoder)
-            decoder_dict = get_named_params_dicts(decoder)
-
-            per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch)
-
-            total_losses = []
-
-            for iter in range(args.num_training_steps_per_iter):
-                support_loss, supprt_pred = lstm_forward(
-                    args.num_layers,
-                    encoder,
-                    decoder,
-                    encoder_copy_params,
-                    decoder_copy_params,
-                    support_input_seq,
-                    support_obs_seq,
-                    args.obs_len,
-                    args.pred_len,
-                    criterion,
-                    model_utils
-                )
-
-                total_losses.append(per_step_loss_importance_vecor[iter] * support_loss)
-
-                encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
-                    support_loss, encoder, decoder, encoder_copy_params, decoder_copy_params, args.second_order
-                )
-
-                if(iter == args.num_training_steps_per_iter - 1):
-                    train_loss, train_preds = lstm_forward(
-                        args.num_layers,
-                        encoder,
-                        decoder,
-                        encoder_copy_params,
-                        decoder_copy_params,
-                        train_input_seq,
-                        train_obs_seq,
-                        args.obs_len,
-                        args.pred_len,
-                        criterion,
-                        model_utils
-                    ) 
-                    total_losses.append(train_loss)
-
-
-            # Zero the gradients
-            encoder_optimizer.zero_grad()
-            decoder_optimizer.zero_grad()
-
-            #loss = train_loss
-            loss = torch.sum(torch.stack(total_losses))
-
-            if global_step % 1000 == 0:
-                loss_list.append(loss.item())
-
-            # Backpropagate
-            loss.backward()
-            clamp_grads(encoder)
-            clamp_grads(decoder)
-
-            encoder_optimizer.step()
-            decoder_optimizer.step()
-            #if j % 100 == 0:
-            print(
-                f"Training inner loop {j}-- Epoch:{epoch}, loss:{loss}, Rollout:{rollout_len}")
-
-        if global_step % 1000 == 0:
-
-            # Log results
-            avg_loss = np.array(loss_list).mean()
-            print(
-                f"--------------------------------------\n\
-                Train -- Epoch:{epoch}, avg loss:{avg_loss}, Rollout:{rollout_len}\n\
-                --------------------------------------")
-
-            logger.scalar_summary(tag="Train/loss",
-                                  value=avg_loss,
-                                  step=epoch)
-
-        global_step += 1
 
 def maml_forward(
         args : Any,
@@ -1119,13 +857,11 @@ def maml_forward(
 
     train_input_seq = train_input_seq.squeeze(1).to(device)
     train_obs_seq = train_obs_seq.squeeze(1).to(device)
-    support_input_seqs = support_input_seqs.to(device)
-    support_obs_seqs = support_obs_seqs.to(device)
 
         # Copy the model for MAML inner loop
     shot = args.shot if args.shot <= args.train_batch_size else args.train_batch_size
-    support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1)
-    support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1)
+    support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1).to_device()
+    support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1).to_device()
 
     encoder_copy_params = get_named_params_dicts(encoder)
     decoder_copy_params = get_named_params_dicts(decoder)
@@ -1160,6 +896,7 @@ def maml_forward(
             args.second_order,
             encoder_learning_rule, decoder_learning_rule,
             iter_,
+            args.per_step_maml_optimization,
         )
 
         if(iter_ == args.num_training_steps_per_iter - 1):
@@ -1177,10 +914,6 @@ def maml_forward(
                 model_utils
             ) 
             total_losses.append(train_loss)
-
-            all_objects = muppy.get_objects()
-            sum1 = summary.summarize(all_objects)
-            summary.print_(sum1)
 
     #loss = train_loss
     loss = torch.sum(torch.stack(total_losses)).to(device)
@@ -1262,19 +995,12 @@ def train_maml_oversimplified(
             encoder_scheduler.step(epoch=epoch)
             decoder_scheduler.step(epoch=epoch)
 
-            #if i % 100 == 0:
-            #print(
-            #    f"Train -- Optimizer loop:{i} Epoch:{epoch}, avg loss:{loss}, Rollout:{rollout_len}")
             if i % 100 == 0:
-                pbar.write(f"Train -- Optimizer loop:{i} Epoch:{epoch}, avg loss:{loss}, Rollout:{rollout_len}")
+                pbar.write(f"Train -- Optimizer loop:{i} Epoch:{epoch}, avg loss:{loss.detach().item()}, Rollout:{rollout_len}")
             if global_step % 1000 == 0:
 
-                # Log results
-                #print(
-                #    f"Train -- Epoch:{epoch}, avg loss:{loss}, Rollout:{rollout_len}")
-
                 logger.scalar_summary(tag="Train/loss",
-                                      value=loss.item(),
+                                      value=loss.detach().item(),
                                       step=epoch)
 
             global_step += 1
@@ -1345,12 +1071,12 @@ def validate_maml(
                 decoder_learning_rule = decoder_learning_rule,
             )
 
-            total_loss.append(loss)
+            total_loss.append(loss.detach().item())
 
             if i % 10 == 0:
 
                 pbar.write(
-                    f"Val -- Epoch:{epoch}, loss:{loss}, Rollout: {rollout_len}",
+                    f"Val -- Epoch:{epoch}, loss:{loss.detach().item()}, Rollout: {rollout_len}",
                 )
 
     # Save
@@ -1378,10 +1104,12 @@ def validate_maml(
                 "decoder_optimizer": decoder_optimizer.state_dict(),
                 "encoder_learning_rate": encoder_scheduler.get_lr(),
                 "decoder_learning_rate": decoder_scheduler.get_lr(),
+                "encoder_learning_rule_dict":encoder_learning_rule.get_lr_dict(),
+                "decoder_learning_rule_dict":decoder_learning_rule.get_lr_dict(),
             },
         )
 
-    logger.scalar_summary(tag="Val/loss", value=val_loss.item(), step=epoch)
+    logger.scalar_summary(tag="Val/loss", value=val_loss, step=epoch)
 
     # Keep track of the loss to change preiction horizon
     if val_loss <= prev_loss:

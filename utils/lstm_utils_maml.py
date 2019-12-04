@@ -8,6 +8,7 @@ import torch
 from torch.autograd import Variable
 from torch.utils.data import Dataset
 
+from collections import OrderedDict
 import utils.baseline_config as config
 
 use_cuda = torch.cuda.is_available()
@@ -250,10 +251,10 @@ class LSTMDataset_maml_simplified(Dataset):
         self.args = args
         self.mode = mode
         self.seed = seed
-        if mode != "test":
-            self.obs_len = args.obs_len
-            self.num_target_samples = args.num_target_samples
-            self.shot = args.shot
+            
+        self.obs_len = args.obs_len
+        self.num_target_samples = args.num_target_samples
+        self.shot = args.shot
 
 
         # Get input
@@ -297,15 +298,15 @@ class LSTMDataset_maml_simplified(Dataset):
         train_input_seq = train_input_set[1:]
 
         train_output_set = self.output_data[samples_list, :] if self.mode != 'test' else None
-        support_obs_seq   = train_output_set[:1] if self.mode !='test' else None
-        train_obs_seq   = train_output_set[1:] if self.mode != 'test' else None
+        support_obs_seq   = train_output_set[:1] if self.mode !='test' else torch.empty(1)
+        train_obs_seq   = train_output_set[1:] if self.mode != 'test' else torch.empty(1)
 
         return(
             torch.FloatTensor(support_input_seq),
             torch.FloatTensor(support_obs_seq), 
             torch.FloatTensor(train_input_seq),
             torch.FloatTensor(train_obs_seq),
-            [self.helpers[idx] for idx in samples_list[1:]],
+            self.helpers[idx],
         )
 
 
@@ -394,6 +395,18 @@ class ModelUtils:
             epoch = checkpoint["epoch"]
             best_loss = checkpoint["best_loss"]
             rollout_len = checkpoint["rollout_len"]
+            
+            # Remove "module" from encoder and decoder state dictionary keys
+            newdict = OrderedDict()
+            for key, value in checkpoint["encoder_state_dict"].items():
+                newdict[key.replace('module.','')] = value    
+            checkpoint["encoder_state_dict"] = newdict
+            
+            newdict = OrderedDict()
+            for key, value in checkpoint["decoder_state_dict"].items():
+                newdict[key.replace('module.','')] = value    
+            checkpoint["decoder_state_dict"] = newdict
+
             if use_cuda:
                 encoder.module.load_state_dict(
                     checkpoint["encoder_state_dict"])

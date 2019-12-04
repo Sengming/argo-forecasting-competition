@@ -719,6 +719,30 @@ def get_test_data_dict_subset(
         test_data_dict_batches[i] = new_dict
     return test_data_dict_batches
 
+def get_support_data_dict_subset(
+        data_dict: Dict[str, Union[np.ndarray, None]],
+        args: Any) -> Dict[int, Dict[str, Union[np.ndarray, None]]]:
+    """Get test subset from data dict. Useful when used with joblib as we don't need to pass the entire data_dict to all the batches.
+
+    Args:
+        data_dict: Data dictionary containing all the data
+        args: Arguments passed to the baseline
+
+    Returns:
+        test_data_dict_batches: test data subsets. key is the start index of the joblib batch
+                                and value is the subset of test data corresponding to that batch.
+
+    """
+    val_size = data_dict["val_input"].shape[0]
+    val_data_dict_batches = {}
+    for i in range(0, val_size, args.joblib_batch_size):
+        new_dict = {}
+        for k, v in data_dict.items():
+            if k in ["val_input", "val_helpers", "val_output"]:
+                new_dict[k] = v[i:i + args.joblib_batch_size]
+        val_data_dict_batches[i] = new_dict
+    return val_data_dict_batches
+
 
 def validate_args(args: Any) -> bool:
     """Validate the arguments passed to the baseline.

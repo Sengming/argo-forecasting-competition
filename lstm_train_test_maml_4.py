@@ -49,7 +49,7 @@ global_step = 0
 best_loss = float("inf")
 np.random.seed(100)
 
-ROLLOUT_LENS = [1, 10, 30]
+ROLLOUT_LENS = [30]
 
 
 def parse_arguments() -> Any:
@@ -625,7 +625,6 @@ def train(
 
         # Get average loss for pred_len
         loss = loss / rollout_len
-
         # Backpropagate
         loss.backward()
         encoder_optimizer.step()
@@ -694,7 +693,7 @@ def lstm_forward(
 
     # Get average loss for pred_len
     loss = loss / pred_len
-
+    
     return loss, decoder_outputs
 
 def get_named_params_dicts(
@@ -870,6 +869,7 @@ def maml_forward(
     encoder_dict = get_named_params_dicts(encoder)
     decoder_dict = get_named_params_dicts(decoder)
 
+    train_preds = None
     total_losses = []
     
     for iter_ in range(args.num_training_steps_per_iter):
@@ -917,7 +917,10 @@ def maml_forward(
 
     #loss = train_loss
     loss = torch.sum(torch.stack(total_losses)).to(device)
-    return loss
+    if args.test is False:
+        return loss
+    else:
+        return loss, train_preds
 
 def train_maml_oversimplified(
         train_loader: Any,
@@ -1365,6 +1368,123 @@ def infer_absolute(
               "wb") as f:
         pkl.dump(forecasted_trajectories, f)
 
+def infer_maml_map(
+        test_loader: Any,
+        support_loader: Any,
+        encoder: Any,
+        decoder: Any,
+        start_idx: int,
+        forecasted_save_dir: str,
+        model_utils: ModelUtils,
+        epoch: int,
+        loader_len : int,
+        support_loader_len: int,
+):
+    """Infer function for map-based LSTM baselines and save the forecasted trajectories.
+
+    Args:
+        test_loader: DataLoader for the test set
+        encoder: Encoder network instance
+        decoder: Decoder network instance
+        start_idx: start index for the current joblib batch
+        forecasted_save_dir: Directory where forecasted trajectories are to be saved
+        model_utils: ModelUtils instance
+        epoch: Epoch at which we ended training at
+    """
+    
+    forecasted_trajectories = {}
+    args = parse_arguments()
+    per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch)
+    criterion = nn.MSELoss()
+    total_loss = []
+
+    with tqdm(total=loader_len, desc='Testing on epoch: {}'.format(epoch), position=0) as pbar:
+        for i, data_batch in enumerate(test_loader):
+
+            # Support task data batch:
+            support_batch = next(iter(support_loader))
+
+            encoder.eval()
+            decoder.eval()
+            pbar.update(1)
+
+            loss = 0
+            (support_input_seqs, support_obs_seqs, test_input_seq, test_obs_seq, helpers) = data_batch
+            batch_helpers = list(zip(*helpers))
+
+            helpers_dict = {}
+            for k, v in config.LSTM_HELPER_DICT_IDX.items():
+                helpers_dict[k] = batch_helpers[v]
+        
+            batch_size = test_input_seq.shape[0]
+            input_length = test_input_seq.shape[2]
+           
+            for batch_idx in range(batch_size):
+                num_candidates = len(
+                    helpers_dict["CANDIDATE_CENTERLINES"][batch_idx])
+                curr_centroids = helpers_dict["CENTROIDS"][batch_idx]
+                seq_id = int(helpers_dict["SEQ_PATHS"][batch_idx])
+                abs_outputs = []
+
+                # Predict using every centerline candidate for the current trajectory
+                for candidate_idx in range(num_candidates):
+                    curr_centerline = helpers_dict["CANDIDATE_CENTERLINES"][
+                        batch_idx][candidate_idx]
+                    curr_nt_dist = helpers_dict["CANDIDATE_NT_DISTANCES"][
+                        batch_idx][candidate_idx]
+
+                    # Since this is test set all our inputs are gonna be None, gotta build
+                    # them ourselves.
+                    test_input_seq = torch.FloatTensor(
+                    np.expand_dims(curr_nt_dist[:args.obs_len].astype(float),
+                                   0)).to(device)
+
+                    # Update support batch and feed to maml_forward
+                    tempbatch = list(support_batch)
+                    tempbatch[2] = test_input_seq.unsqueeze(0)
+                    support_batch = tuple(tempbatch)
+
+                    loss, preds = maml_forward(
+                        args = args,
+                        data_batch = support_batch,
+                        epoch = epoch,
+                        criterion = criterion,
+                        encoder = encoder,
+                        decoder = decoder,
+                        model_utils = model_utils,
+                        per_step_loss_importance_vecor = per_step_loss_importance_vecor,
+                        second_order = False,
+                        rollout_len = args.pred_len,
+                        encoder_learning_rule = None,
+                        decoder_learning_rule = None,
+                    )
+                    # Preds has been broadcasted to the shape of output, which means it has batch size,
+                    # but actually it's just copied, so take one of the elements only
+                    preds = preds[0,:,:].unsqueeze(0)
+                    # Get absolute trajectory
+                    abs_helpers = {}
+                    abs_helpers["REFERENCE"] = np.expand_dims(
+                        np.array(helpers_dict["CANDIDATE_DELTA_REFERENCES"]
+                                 [batch_idx][candidate_idx]),
+                        0,
+                    )
+                    abs_helpers["CENTERLINE"] = np.expand_dims(curr_centerline, 0)
+
+                    abs_input, abs_output = baseline_utils.get_abs_traj(
+                        test_input_seq.clone().cpu().numpy(),
+                        preds.detach().clone().cpu().numpy(),
+                        args,
+                        abs_helpers,
+                    )
+
+                    # array of shape (1,30,2) to list of (30,2)
+                    abs_outputs.append(abs_output[0])
+                forecasted_trajectories[seq_id] = abs_outputs
+
+    os.makedirs(forecasted_save_dir, exist_ok=True)
+    with open(os.path.join(forecasted_save_dir, f"{start_idx}.pkl"),
+              "wb") as f:
+        pkl.dump(forecasted_trajectories, f)
 
 def infer_map(
         test_loader: torch.utils.data.DataLoader,
@@ -1480,11 +1600,13 @@ def infer_map(
 
 def infer_helper(
         curr_data_dict: Dict[str, Any],
+        support_data_dict: Dict[str, Any],
         start_idx: int,
         encoder: EncoderRNN,
         decoder: DecoderRNN,
         model_utils: ModelUtils,
         forecasted_save_dir: str,
+        epoch: int
 ):
     """Run inference on the current joblib batch.
 
@@ -1495,27 +1617,55 @@ def infer_helper(
         decoder: Decoder network instance
         model_utils: ModelUtils instance
         forecasted_save_dir: Directory where forecasted trajectories are to be saved
-
+        epoch: The epoch which we stopped training at
     """
     args = parse_arguments()
-    curr_test_dataset = LSTMDataset(curr_data_dict, args, "test")
+
+    curr_test_dataset = LSTMDataset_maml_simplified(curr_data_dict, args, "test", 0)
     curr_test_loader = torch.utils.data.DataLoader(
         curr_test_dataset,
         shuffle=False,
         batch_size=args.test_batch_size,
-        collate_fn=model_utils.my_collate_fn,
+        collate_fn=model_utils.my_collate_fn_maml,
     )
+    test_loader_len = len(iter(curr_test_loader))
+   
+    # For now use test batch size because test is same as val
+    curr_support_dataset = LSTMDataset_maml_simplified(support_data_dict, args, "val", 0)
+    curr_support_loader = torch.utils.data.DataLoader(
+        curr_support_dataset,
+        shuffle=False,
+        # TODO fix later
+        batch_size=args.test_batch_size,
+        collate_fn=model_utils.my_collate_fn_maml,
+    )
+    support_loader_len = len(iter(curr_support_loader))
 
     if args.use_map:
-        print(f"#### LSTM+map inference at index {start_idx} ####")
-        infer_map(
-            curr_test_loader,
-            encoder,
-            decoder,
-            start_idx,
-            forecasted_save_dir,
-            model_utils,
-        )
+        if args.maml:
+            print(f"#### LSTM+map maml inference at index {start_idx} ####")
+            infer_maml_map(
+                curr_test_loader,
+                curr_support_loader,
+                encoder,
+                decoder,
+                start_idx,
+                forecasted_save_dir,
+                model_utils,
+                epoch,
+                test_loader_len,
+                support_loader_len,
+            )
+        else:
+            print(f"#### LSTM+map inference at index {start_idx} ####")
+            infer_map(
+                curr_test_loader,
+                encoder,
+                decoder,
+                start_idx,
+                forecasted_save_dir,
+                model_utils,
+            )
 
     else:
         print(f"#### LSTM+social inference at {start_idx} ####"
@@ -1752,11 +1902,17 @@ def main():
         test_size = data_dict["test_input"].shape[0]
         test_data_subsets = baseline_utils.get_test_data_dict_subset(
             data_dict, args)
-
+        
+        # We also use val input because support tasks need to train too even during test
+        # Luckily they are the same size since test is actually using val data csv files
+        support_size = data_dict["val_input"].shape[0]
+        support_data_subsets = baseline_utils.get_support_data_dict_subset(
+            data_dict, args)
+        
         # test_batch_size should be lesser than joblib_batch_size
-        Parallel(n_jobs=-2, verbose=2)(
-            delayed(infer_helper)(test_data_subsets[i], i, encoder, decoder,
-                                  model_utils, temp_save_dir)
+        Parallel(n_jobs=2, verbose=2)(
+            delayed(infer_helper)(test_data_subsets[i], support_data_subsets[i], i, encoder, decoder,
+                                  model_utils, temp_save_dir, epoch)
             for i in range(0, test_size, args.joblib_batch_size))
 
         baseline_utils.merge_saved_traj(temp_save_dir, args.traj_save_path)

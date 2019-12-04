@@ -1083,8 +1083,14 @@ def validate_maml(
 
     # Save
     val_loss = sum(total_loss) / len(total_loss)
+    pbar.write(
+        f"Val -- Epoch:{epoch}, avg loss:{val_loss}, Rollout: {rollout_len}",
+    )
 
     if val_loss <= best_loss:
+        pbar.write(
+            f"Val -- Epoch:{epoch}, New best loss: {val_loss}",
+        )
         best_loss = val_loss
         if args.use_map:
             save_dir = "saved_models/lstm_map/best_val"
@@ -1130,8 +1136,8 @@ def validate_maml(
             "best_loss": val_loss,
             "encoder_optimizer": encoder_optimizer.state_dict(),
             "decoder_optimizer": decoder_optimizer.state_dict(),
-            "encoder_learning_rate": encoder_scheduler.get_lr(),
-            "decoder_learning_rate": decoder_scheduler.get_lr(),
+            #"encoder_learning_rate": encoder_scheduler.get_lr(),
+            #"decoder_learning_rate": decoder_scheduler.get_lr(),
             "encoder_learning_rule_dict":encoder_learning_rule.get_lr_dict(),
             "decoder_learning_rule_dict":decoder_learning_rule.get_lr_dict(),
         },
@@ -1744,7 +1750,7 @@ def main():
                     )
 
                     # If val loss increased 3 times consecutively, go to next rollout length
-                    if decrement_counter > 2:
+                    if decrement_counter > 2 or (epoch % 100 == 0 and epoch > 0):
                         break
         #import pdb; pdb.set_trace();
 

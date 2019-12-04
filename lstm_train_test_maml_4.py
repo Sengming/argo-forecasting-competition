@@ -721,11 +721,12 @@ def get_raw_named_params_dicts(
 def update_params(
     param_dict,
     grad_dict,
+    lr_dict = None,
 ):
     args = parse_arguments()
     updated_weights_dict = dict()
     for key in grad_dict.keys():
-        updated_weights_dict[key] = param_dict[key] - args.lr * grad_dict[key]
+        updated_weights_dict[key] = param_dict[key] - (args.lr if lr_dict == None else lr_dict[key.replace('.', '-')]) * grad_dict[key]
 
     return updated_weights_dict
 
@@ -871,7 +872,6 @@ def maml_forward(
     decoder_dict = get_named_params_dicts(decoder)
 
     total_losses = []
-    
     for iter_ in range(args.num_training_steps_per_iter):
         support_loss, supprt_pred = lstm_forward(
             args.num_layers,
@@ -992,8 +992,10 @@ def train_maml_oversimplified(
             encoder_optimizer.step()
             decoder_optimizer.step()
 
-            encoder_scheduler.step(epoch=epoch)
-            decoder_scheduler.step(epoch=epoch)
+            if encoder_scheduler is not None:
+                encoder_scheduler.step(epoch=epoch)
+            if decoder_scheduler is not None:
+                decoder_scheduler.step(epoch=epoch)
 
             if i % 100 == 0:
                 pbar.write(f"Train -- Optimizer loop:{i} Epoch:{epoch}, avg loss:{loss.detach().item()}, Rollout:{rollout_len}")
@@ -1102,8 +1104,8 @@ def validate_maml(
                 "best_loss": val_loss,
                 "encoder_optimizer": encoder_optimizer.state_dict(),
                 "decoder_optimizer": decoder_optimizer.state_dict(),
-                "encoder_learning_rate": encoder_scheduler.get_lr(),
-                "decoder_learning_rate": decoder_scheduler.get_lr(),
+                #"encoder_learning_rate": encoder_scheduler.get_lr(),
+                #"decoder_learning_rate": decoder_scheduler.get_lr(),
                 "encoder_learning_rule_dict":encoder_learning_rule.get_lr_dict(),
                 "decoder_learning_rule_dict":decoder_learning_rule.get_lr_dict(),
             },
@@ -1550,10 +1552,12 @@ def main():
 
     encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr, amsgrad=False)
     decoder_optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr, amsgrad=False)
-    encoder_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=encoder_optimizer, T_max=args.end_epoch,
-                                                              eta_min=args.min_lr)
-    decoder_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=decoder_optimizer, T_max=args.end_epoch,
-                                                              eta_min=args.min_lr)
+    #encoder_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=encoder_optimizer, T_max=args.end_epoch,
+    #                                                          eta_min=args.min_lr)
+    #decoder_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=decoder_optimizer, T_max=args.end_epoch,
+    #                                                          eta_min=args.min_lr)
+    encoder_scheduler = None
+    decoder_scheduler = None
     encoder_optimizers = (encoder_optimizer, encoder_scheduler)
     decoder_optimizers = (decoder_optimizer, decoder_scheduler)
 
@@ -1627,6 +1631,7 @@ def main():
         global_start_time = time.time()
         train_loader_len = len(iter(train_loader))
         val_loader_len = len(iter(val_loader))
+        #import pdb; pdb.set_trace();
         for i in range(start_rollout_idx, len(ROLLOUT_LENS)):
             rollout_len = ROLLOUT_LENS[i]
             logger = Logger(log_dir, name="{}".format(rollout_len))

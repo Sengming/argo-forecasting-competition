@@ -290,7 +290,7 @@ def train(
 
         # Get average loss for pred_len
         loss = loss / rollout_len
-
+        import pdb; pdb.set_trace()
         # Backpropagate
         loss.backward()
         encoder_optimizer.step()
@@ -553,11 +553,11 @@ def infer_map(
     global best_loss
     forecasted_trajectories = {}
     for i, (_input, target, helpers) in enumerate(test_loader):
-
+        import pdb; pdb.set_trace()
         _input = _input.to(device)
 
         batch_helpers = list(zip(*helpers))
-
+        import pdb; pdb.set_trace()
         helpers_dict = {}
         for k, v in config.LSTM_HELPER_DICT_IDX.items():
             helpers_dict[k] = batch_helpers[v]
@@ -842,7 +842,7 @@ def main():
             data_dict, args)
 
         # test_batch_size should be lesser than joblib_batch_size
-        Parallel(n_jobs=-2, verbose=2)(
+        Parallel(n_jobs=1, verbose=2)(
             delayed(infer_helper)(test_data_subsets[i], i, encoder, decoder,
                                   model_utils, temp_save_dir)
             for i in range(0, test_size, args.joblib_batch_size))

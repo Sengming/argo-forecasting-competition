@@ -1427,68 +1427,70 @@ def infer_maml_map(
             batch_size = test_input_seq.shape[0]
             input_length = test_input_seq.shape[2]
            
-            for batch_idx in range(batch_size):
-                num_candidates = len(
-                    helpers_dict["CANDIDATE_CENTERLINES"][batch_idx])
-                curr_centroids = helpers_dict["CENTROIDS"][batch_idx]
-                seq_id = int(helpers_dict["SEQ_PATHS"][batch_idx])
-                abs_outputs = []
+            with tqdm(total=batch_size, desc='Iterating over batch', position=1) as pbar2:
+                for batch_idx in range(batch_size):
+                    pbar2.update(1)
+                    num_candidates = len(
+                        helpers_dict["CANDIDATE_CENTERLINES"][batch_idx])
+                    curr_centroids = helpers_dict["CENTROIDS"][batch_idx]
+                    seq_id = int(helpers_dict["SEQ_PATHS"][batch_idx])
+                    abs_outputs = []
+                    # Predict using every centerline candidate for the current trajectory
+                    for candidate_idx in range(num_candidates):
+                        curr_centerline = helpers_dict["CANDIDATE_CENTERLINES"][
+                            batch_idx][candidate_idx]
+                        curr_nt_dist = helpers_dict["CANDIDATE_NT_DISTANCES"][
+                            batch_idx][candidate_idx]
 
-                # Predict using every centerline candidate for the current trajectory
-                for candidate_idx in range(num_candidates):
-                    curr_centerline = helpers_dict["CANDIDATE_CENTERLINES"][
-                        batch_idx][candidate_idx]
-                    curr_nt_dist = helpers_dict["CANDIDATE_NT_DISTANCES"][
-                        batch_idx][candidate_idx]
+                        # Since this is test set all our inputs are gonna be None, gotta build
+                        # them ourselves.
+                        test_input_seq = torch.FloatTensor(
+                        np.expand_dims(curr_nt_dist[:args.obs_len].astype(float),
+                                       0)).to(device)
 
-                    # Since this is test set all our inputs are gonna be None, gotta build
-                    # them ourselves.
-                    test_input_seq = torch.FloatTensor(
-                    np.expand_dims(curr_nt_dist[:args.obs_len].astype(float),
-                                   0)).to(device)
+                        # Update support batch and feed to maml_forward
+                        tempbatch = list(support_batch)
+                        tempbatch[2] = test_input_seq.unsqueeze(0)
+                        support_batch = tuple(tempbatch)
 
-                    # Update support batch and feed to maml_forward
-                    tempbatch = list(support_batch)
-                    tempbatch[2] = test_input_seq.unsqueeze(0)
-                    support_batch = tuple(tempbatch)
+                        loss, preds = maml_forward(
+                            args = args,
+                            data_batch = support_batch,
+                            epoch = epoch,
+                            criterion = criterion,
+                            encoder = encoder,
+                            decoder = decoder,
+                            model_utils = model_utils,
+                            per_step_loss_importance_vecor = per_step_loss_importance_vecor,
+                            second_order = False,
+                            rollout_len = args.pred_len,
+                            encoder_learning_rule = None,
+                            decoder_learning_rule = None,
+                        )
+                        # Preds has been broadcasted to the shape of output, which means it has batch size,
+                        # but actually it's just copied, so take one of the elements only
+                        preds = preds[0,:,:].unsqueeze(0)
+                        # Get absolute trajectory
+                        abs_helpers = {}
+                        abs_helpers["REFERENCE"] = np.expand_dims(
+                            np.array(helpers_dict["CANDIDATE_DELTA_REFERENCES"]
+                                     [batch_idx][candidate_idx]),
+                            0,
+                        )
+                        abs_helpers["CENTERLINE"] = np.expand_dims(curr_centerline, 0)
 
-                    loss, preds = maml_forward(
-                        args = args,
-                        data_batch = support_batch,
-                        epoch = epoch,
-                        criterion = criterion,
-                        encoder = encoder,
-                        decoder = decoder,
-                        model_utils = model_utils,
-                        per_step_loss_importance_vecor = per_step_loss_importance_vecor,
-                        second_order = False,
-                        rollout_len = args.pred_len,
-                        encoder_learning_rule = None,
-                        decoder_learning_rule = None,
-                    )
-                    # Preds has been broadcasted to the shape of output, which means it has batch size,
-                    # but actually it's just copied, so take one of the elements only
-                    preds = preds[0,:,:].unsqueeze(0)
-                    # Get absolute trajectory
-                    abs_helpers = {}
-                    abs_helpers["REFERENCE"] = np.expand_dims(
-                        np.array(helpers_dict["CANDIDATE_DELTA_REFERENCES"]
-                                 [batch_idx][candidate_idx]),
-                        0,
-                    )
-                    abs_helpers["CENTERLINE"] = np.expand_dims(curr_centerline, 0)
+                        abs_input, abs_output = baseline_utils.get_abs_traj(
+                            test_input_seq.clone().cpu().numpy(),
+                            preds.detach().clone().cpu().numpy(),
+                            args,
+                            abs_helpers,
+                        )
 
-                    abs_input, abs_output = baseline_utils.get_abs_traj(
-                        test_input_seq.clone().cpu().numpy(),
-                        preds.detach().clone().cpu().numpy(),
-                        args,
-                        abs_helpers,
-                    )
-
-                    # array of shape (1,30,2) to list of (30,2)
-                    abs_outputs.append(abs_output[0])
-                forecasted_trajectories[seq_id] = abs_outputs
-
+                        # array of shape (1,30,2) to list of (30,2)
+                        abs_outputs.append(abs_output[0])
+                    import pdb; pdb.set_trace()
+                    forecasted_trajectories[seq_id] = abs_outputs
+    import pdb; pdb.set_trace()
     os.makedirs(forecasted_save_dir, exist_ok=True)
     with open(os.path.join(forecasted_save_dir, f"{start_idx}.pkl"),
               "wb") as f:
@@ -1921,7 +1923,7 @@ def main():
             data_dict, args)
         
         # test_batch_size should be lesser than joblib_batch_size
-        Parallel(n_jobs=2, verbose=2)(
+        Parallel(n_jobs=1, verbose=2)(
             delayed(infer_helper)(test_data_subsets[i], support_data_subsets[i], i, encoder, decoder,
                                   model_utils, temp_save_dir, epoch)
             for i in range(0, test_size, args.joblib_batch_size))

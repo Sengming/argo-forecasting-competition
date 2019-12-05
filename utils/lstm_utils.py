@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.autograd import Variable
 from torch.utils.data import Dataset
+from collections import OrderedDict
 
 import utils.baseline_config as config
 
@@ -154,6 +155,18 @@ class ModelUtils:
             epoch = checkpoint["epoch"]
             best_loss = checkpoint["best_loss"]
             rollout_len = checkpoint["rollout_len"]
+            
+            # Remove "module" from encoder and decoder state dictionary keys
+            newdict = OrderedDict()
+            for key, value in checkpoint["encoder_state_dict"].items():
+                newdict[key.replace('module.','')] = value    
+            checkpoint["encoder_state_dict"] = newdict
+            
+            newdict = OrderedDict()
+            for key, value in checkpoint["decoder_state_dict"].items():
+                newdict[key.replace('module.','')] = value    
+            checkpoint["decoder_state_dict"] = newdict
+
             if use_cuda:
                 encoder.module.load_state_dict(
                     checkpoint["encoder_state_dict"])

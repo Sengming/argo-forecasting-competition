@@ -31,8 +31,6 @@ import math
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from torchviz import make_dot
-from pympler import muppy, summary
 
 from logger import Logger
 import utils.baseline_config as config
@@ -899,21 +897,20 @@ def maml_forward(
             args.per_step_maml_optimization,
         )
 
-        if(iter_ == args.num_training_steps_per_iter - 1):
-            train_loss, train_preds = lstm_forward(
-                args.num_layers,
-                encoder,
-                decoder,
-                encoder_copy_params,
-                decoder_copy_params,
-                train_input_seq,
-                train_obs_seq,
-                args.obs_len,
-                rollout_len,
-                criterion,
-                model_utils
-            ) 
-            total_losses.append(train_loss)
+    train_loss, train_preds = lstm_forward(
+        args.num_layers,
+        encoder,
+        decoder,
+        encoder_copy_params,
+        decoder_copy_params,
+        train_input_seq,
+        train_obs_seq,
+        args.obs_len,
+        rollout_len,
+        criterion,
+        model_utils
+    ) 
+    total_losses.append(train_loss)
 
     #loss = train_loss
     loss = torch.sum(torch.stack(total_losses)).to(device)
@@ -958,7 +955,7 @@ def train_maml_oversimplified(
     (encoder_optimizer, encoder_scheduler) = encoder_optimizers
     (decoder_optimizer, decoder_scheduler) = decoder_optimizers
     
-    per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch)
+    per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch) 
             
     with tqdm(total=loader_len, desc='Epoch: {}'.format(epoch), position=0) as pbar:
         for i, data_batch in enumerate(train_loader):
@@ -1402,7 +1399,7 @@ def infer_maml_map(
     
     forecasted_trajectories = {}
     args = parse_arguments()
-    per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch)
+    per_step_loss_importance_vecor = get_per_step_loss_importance_vector(args, epoch) if args.num_training_steps_per_iter > 0 else None
     criterion = nn.MSELoss()
     total_loss = []
 
@@ -1436,6 +1433,7 @@ def infer_maml_map(
                     seq_id = int(helpers_dict["SEQ_PATHS"][batch_idx])
                     abs_outputs = []
                     # Predict using every centerline candidate for the current trajectory
+                    import pdb; pdb.set_trace();
                     for candidate_idx in range(num_candidates):
                         curr_centerline = helpers_dict["CANDIDATE_CENTERLINES"][
                             batch_idx][candidate_idx]

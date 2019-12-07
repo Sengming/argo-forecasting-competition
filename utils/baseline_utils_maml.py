@@ -824,11 +824,13 @@ class LSLRGradientDescentLearningRule(nn.Module):
         param_dict,
         grad_dict,
         step,
+        lr_dict = None,
     ):
         updated_weights_dict = dict()
+        names_learning_rates_dict = self.names_learning_rates_dict if lr_dict is None else lr_dict
         for key in grad_dict.keys():
             updated_weights_dict[key] = param_dict[key] - \
-                 self.names_learning_rates_dict[key.replace(".", "-")][step] * grad_dict[key]
+                 names_learning_rates_dict[key.replace(".", "-")][step] * grad_dict[key]
     
         return updated_weights_dict
 

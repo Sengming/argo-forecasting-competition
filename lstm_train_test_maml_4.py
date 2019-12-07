@@ -1548,6 +1548,7 @@ def infer_maml_map(
                                        0)).to(device)
 
                         # Update support batch and feed to maml_forward
+                        import pdb; pdb.set_trace()
                         tempbatch = list(support_batch)
                         tempbatch[2] = test_input_seq.unsqueeze(0)
                         support_batch = tuple(tempbatch)
@@ -1587,9 +1588,7 @@ def infer_maml_map(
 
                         # array of shape (1,30,2) to list of (30,2)
                         abs_outputs.append(abs_output[0])
-                    import pdb; pdb.set_trace()
                     forecasted_trajectories[seq_id] = abs_outputs
-    import pdb; pdb.set_trace()
     os.makedirs(forecasted_save_dir, exist_ok=True)
     with open(os.path.join(forecasted_save_dir, f"{start_idx}.pkl"),
               "wb") as f:
@@ -1963,9 +1962,12 @@ def main():
     encoder_optimizers = (encoder_optimizer, encoder_scheduler)
     decoder_optimizers = (decoder_optimizer, decoder_scheduler)
 
+    encoder_learning_rule_dict = None
+    decoder_learning_rule_dict = None
+
     # If model_path provided, resume from saved checkpoint
     if args.model_path is not None and os.path.isfile(args.model_path):
-        epoch, rollout_len, _ = model_utils.load_checkpoint(
+        epoch, rollout_len, _, encoder_learning_rule_dict, decoder_learning_rule_dict = model_utils.load_checkpoint(
             args.model_path, encoder, decoder, encoder_optimizer,
             decoder_optimizer)
         start_epoch = epoch + 1
@@ -2010,6 +2012,8 @@ def main():
             collate_fn=model_utils.my_collate_fn_maml if args.maml else model_utils.my_collate_fn,
         )
 
+        encoder_learning_rule_and_dict = (None, None)
+        decoder_learning_rule_and_dict = (None, None)
         if args.use_lslr:
             encoder_learning_rule = baseline_utils.LSLRGradientDescentLearningRule(
                 device, args.num_training_steps_per_iter, args.use_learnable_lr, 1e-3,
@@ -2019,6 +2023,11 @@ def main():
             )
             encoder_learning_rule.initialise(get_named_params_dicts(encoder))
             decoder_learning_rule.initialise(get_named_params_dicts(decoder))
+
+            if encoder_learning_rule_dict and decoder_learning_rule_dict:
+                encoder_learning_rule_and_dict = (encoder_learning_rule, encoder_learning_rule_dict)
+                decoder_learning_rule_and_dict = (decoder_learning_rule, decoder_learning_rule_dict)
+
         else:
             encoder_learning_rule = None
             decoder_learning_rule = None

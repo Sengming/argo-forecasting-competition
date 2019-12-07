@@ -375,7 +375,7 @@ class ModelUtils:
             decoder: Any,
             encoder_optimizer: Any,
             decoder_optimizer: Any,
-    ) -> Tuple[int, int, float]:
+    ) -> Tuple[int, int, float, dict]:
         """Load the checkpoint.
 
         Args:
@@ -395,7 +395,10 @@ class ModelUtils:
             epoch = checkpoint["epoch"]
             best_loss = checkpoint["best_loss"]
             rollout_len = checkpoint["rollout_len"]
-            
+           
+            encoder_learning_rule_dict = checkpoint["encoder_learning_rule_dict"]
+            decoder_learning_rule_dict = checkpoint["decoder_learning_rule_dict"]
+
             # Remove "module" from encoder and decoder state dictionary keys
             newdict = OrderedDict()
             for key, value in checkpoint["encoder_state_dict"].items():
@@ -415,6 +418,7 @@ class ModelUtils:
             else:
                 encoder.load_state_dict(checkpoint["encoder_state_dict"])
                 decoder.load_state_dict(checkpoint["decoder_state_dict"])
+            
             encoder_optimizer.load_state_dict(checkpoint["encoder_optimizer"])
             decoder_optimizer.load_state_dict(checkpoint["decoder_optimizer"])
             print(
@@ -423,7 +427,7 @@ class ModelUtils:
         else:
             print(f"=> no checkpoint found at {checkpoint_file}")
 
-        return epoch, rollout_len, best_loss
+        return epoch, rollout_len, best_loss, encoder_learning_rule_dict, decoder_learning_rule_dict
 
     def my_collate_fn(self, batch: List[Any]) -> List[Any]:
         """Collate function for PyTorch DataLoader.

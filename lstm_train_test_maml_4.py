@@ -694,6 +694,52 @@ def lstm_forward(
     
     return loss, decoder_outputs
 
+def lstm_infer_forward(
+    num_layers,
+    encoder: Any,
+    decoder: Any,
+    encoder_params: Any,
+    decoder_params: Any,
+    input_seq: Any,
+    target_seq: Any,
+    obs_len: int,
+    pred_len: int,
+    model_utils: ModelUtils,
+):
+    batch_size =  input_seq.shape[0]
+    # Initialize losses
+
+    encoder_hidden = create_init_params(num_layers,
+                                        batch_size,
+                                        encoder.module.hidden_size if use_cuda else encoder.hidden_size,
+                                        model_utils,)
+
+
+    #import pdb; pdb.set_trace()
+    # Encode observed trajectory
+    for ei in range(obs_len):
+        encoder_input = input_seq[:, ei, :]
+        encoder_hidden = encoder(encoder_input, encoder_hidden, encoder_params)
+
+    # Initialize decoder input with last coordinate in encoder
+    decoder_input = encoder_input[:, :2]
+
+    # Initialize decoder hidden state as encoder hidden state
+    decoder_hidden = encoder_hidden
+
+    decoder_outputs = torch.zeros(target_seq.shape).to(device)
+
+    # Decode hidden state in future trajectory
+    for di in range(pred_len):
+        decoder_output, decoder_hidden = decoder(decoder_input,
+                                                 decoder_hidden, decoder_params)
+        decoder_outputs[:, di, :] = decoder_output
+
+        # Use own predictions as inputs at next step
+        decoder_input = decoder_output
+
+    return decoder_outputs
+
 def get_named_params_dicts(
     model: Any,
 ):
@@ -750,6 +796,8 @@ def maml_inner_loop_update(
     decoder_learning_rule = None,
     step = 0,
     mamlpp = False,
+    encdoer_lr_dict = None,
+    decoder_lr_dict = None,
 ):
     #import pdb; pdb.set_trace();
     zero_grad(encoder, encoder_params)
@@ -763,7 +811,7 @@ def maml_inner_loop_update(
         for grad in decoder_grads:
             grad = grad.detach()
     else:
-        encoder_grads = torch.autograd.grad(loss, encoder_params.values(), create_graph=use_second_order)
+        encoder_grads = torch.autograd.grad(loss, encoder_params.values(), create_graph=use_second_order, retain_graph=True)
         decoder_grads = torch.autograd.grad(loss, decoder_params.values(), create_graph=use_second_order)
 
     encoder_grads_wrt_param_names = dict(zip(encoder_params.keys(), encoder_grads))
@@ -772,12 +820,12 @@ def maml_inner_loop_update(
     if encoder_learning_rule == None:
         encoder_params = update_params(encoder_params, encoder_grads_wrt_param_names)
     else:
-        encoder_params = encoder_learning_rule.update_params(encoder_params, encoder_grads_wrt_param_names, step)
+        encoder_params = encoder_learning_rule.update_params(encoder_params, encoder_grads_wrt_param_names, step, encoder_lr_dict)
         
     if decoder_learning_rule == None:
         decoder_params = update_params(decoder_params, decoder_grads_wrt_param_names) 
     else:
-        decoder_params = decoder_learning_rule.update_params(decoder_params, decoder_grads_wrt_param_names, step)
+        decoder_params = decoder_learning_rule.update_params(decoder_params, decoder_grads_wrt_param_names, step, decder_lr_dict)
 
 
     return encoder_params, decoder_params
@@ -834,6 +882,59 @@ def get_per_step_loss_importance_vector(args, current_epoch):
     loss_weights = torch.Tensor(loss_weights).to(device=device)
     return loss_weights
 
+def maml_infer_forward(
+        args : Any,
+        data_batch: Any,
+        epoch: int,
+        criterion: Any,
+        encoder: Any,
+        decoder: Any,
+        model_utils: ModelUtils,
+        encoder_learning_rules = None,
+        decoder_learning_rules = None,
+):
+
+    rollout_len = args.pred_len
+    (support_input_seqs, support_obs_seqs, _, _, _) = data_batch
+
+        # Copy the model for MAML inner loop
+    shot = args.shot if args.shot <= args.train_batch_size else args.train_batch_size
+    support_input_seq = support_input_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
+    support_obs_seq = support_obs_seqs[:shot, :, :, :].squeeze(dim=1).to(device)
+
+    encoder_copy_params = get_named_params_dicts(encoder)
+    decoder_copy_params = get_named_params_dicts(decoder)
+
+    encoder_learning_rule, encoder_lr_dict = (None, None) if encoder_learning_rules is None else encoder_learning_rules
+    decoder_learning_rule, decoder_lr_dict = (None, None) if decoder_learning_rules is None else decoder_learning_rules
+
+    for iter_ in range(args.num_training_steps_per_iter):
+        support_loss, supprt_pred = lstm_forward(
+            args.num_layers,
+            encoder,
+            decoder,
+            encoder_copy_params,
+            decoder_copy_params,
+            support_input_seq,
+            support_obs_seq,
+            args.obs_len,
+            rollout_len,
+            criterion,
+            model_utils
+        )
+
+        encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
+            support_loss, 
+            encoder, decoder,
+            encoder_copy_params, decoder_copy_params,
+            False,
+            encoder_learning_rule, decoder_learning_rule,
+            iter_,
+            args.per_step_maml_optimization,
+            encoder_lr_dict, decoder_lr_dict,
+        )
+
+    return encoder_copy_params, decoder_copy_params
 
 def maml_forward(
         args : Any,
@@ -1494,6 +1595,123 @@ def infer_maml_map(
               "wb") as f:
         pkl.dump(forecasted_trajectories, f)
 
+def infer_maml_map_simplified(
+        test_loader: Any,
+        support_loader: Any,
+        encoder: Any,
+        decoder: Any,
+        start_idx: int,
+        forecasted_save_dir: str,
+        model_utils: ModelUtils,
+        epoch: int,
+        loader_len : int,
+        encoder_learning_rules = None, 
+        decoder_learning_rules = None,
+
+):
+    """Infer function for map-based LSTM baselines and save the forecasted trajectories.
+
+    Args:
+        test_loader: DataLoader for the test set
+        encoder: Encoder network instance
+        decoder: Decoder network instance
+        start_idx: start index for the current joblib batch
+        forecasted_save_dir: Directory where forecasted trajectories are to be saved
+        model_utils: ModelUtils instance
+        epoch: Epoch at which we ended training at
+    """
+    
+    forecasted_trajectories = {}
+    args = parse_arguments()
+    criterion = nn.MSELoss()
+    total_loss = []
+
+    for i, (support_batch, data_batch) in enumerate(zip(support_loader, test_loader)):
+
+        encoder.eval()
+        decoder.eval()
+
+        encoder_parameters, decoder_parameters = maml_infer_forward(
+                                                   args = args,
+                                                   data_batch = support_batch,
+                                                   epoch = epoch,
+                                                   criterion = criterion,
+                                                   encoder = encoder,
+                                                   decoder = decoder,
+                                                   model_utils = model_utils,
+                                                   encoder_learning_rules = encoder_learning_rules,
+                                                   decoder_learning_rules = decoder_learning_rules,
+                                                 )
+
+        (_, _, _, _, helpers) = data_batch
+        batch_helpers = list(zip(*helpers))
+
+        helpers_dict = {}
+        for k, v in config.LSTM_HELPER_DICT_IDX.items():
+            helpers_dict[k] = batch_helpers[v]
+    
+        batch_size = data_batch[2].shape[0]
+       
+        with tqdm(total=batch_size, desc='Iterating over batch', position=1) as pbar2:
+            for batch_idx in range(batch_size):
+                pbar2.update(1)
+
+                num_candidates = len(helpers_dict["CANDIDATE_CENTERLINES"][batch_idx])
+                curr_centroids = helpers_dict["CENTROIDS"][batch_idx]
+                seq_id = int(helpers_dict["SEQ_PATHS"][batch_idx])
+                abs_outputs = []
+
+                # Predict using every centerline candidate for the current trajectory
+                for candidate_idx in range(num_candidates):
+                    curr_centerline = helpers_dict["CANDIDATE_CENTERLINES"][
+                        batch_idx][candidate_idx]
+                    curr_nt_dist = helpers_dict["CANDIDATE_NT_DISTANCES"][
+                        batch_idx][candidate_idx]
+
+                    # Since this is test set all our inputs are gonna be None, gotta build
+                    # them ourselves.
+                    test_input_seq = torch.FloatTensor(
+                                     np.expand_dims(curr_nt_dist[:args.obs_len].astype(float),
+                                     0)).to(device)
+
+                    test_target_seq = torch.zeros(test_input_seq.shape[0], 30, 2)
+
+                    preds = lstm_infer_forward(
+                              num_layers = args.num_layers,
+                              encoder = encoder,
+                              decoder = decoder,
+                              encoder_params = encoder_parameters,
+                              decoder_params = decoder_parameters,
+                              input_seq = test_input_seq,
+                              target_seq = test_target_seq,
+                              obs_len = args.obs_len,
+                              pred_len = args.pred_len,
+                              model_utils = model_utils,
+                            )
+
+                    abs_helpers = {}
+                    abs_helpers["REFERENCE"] = np.expand_dims(
+                        np.array(helpers_dict["CANDIDATE_DELTA_REFERENCES"]
+                                 [batch_idx][candidate_idx]),
+                        0,
+                    )
+                    abs_helpers["CENTERLINE"] = np.expand_dims(curr_centerline, 0)
+
+                    abs_input, abs_output = baseline_utils.get_abs_traj(
+                        test_input_seq.clone().cpu().numpy(),
+                        preds.detach().clone().cpu().numpy(),
+                        args,
+                        abs_helpers,
+                    )
+
+                    # array of shape (1,30,2) to list of (30,2)
+                    abs_outputs.append(abs_output[0])
+                forecasted_trajectories[seq_id] = abs_outputs
+    os.makedirs(forecasted_save_dir, exist_ok=True)
+    with open(os.path.join(forecasted_save_dir, f"{start_idx}.pkl"),
+              "wb") as f:
+        pkl.dump(forecasted_trajectories, f)
+
 def infer_map(
         test_loader: torch.utils.data.DataLoader,
         encoder: EncoderRNN,
@@ -1614,7 +1832,9 @@ def infer_helper(
         decoder: DecoderRNN,
         model_utils: ModelUtils,
         forecasted_save_dir: str,
-        epoch: int
+        epoch: int,
+        encoder_learning_rules = None, 
+        decoder_learning_rules = None,
 ):
     """Run inference on the current joblib batch.
 
@@ -1647,12 +1867,11 @@ def infer_helper(
         batch_size=args.test_batch_size,
         collate_fn=model_utils.my_collate_fn_maml,
     )
-    support_loader_len = len(iter(curr_support_loader))
 
     if args.use_map:
         if args.maml:
             print(f"#### LSTM+map maml inference at index {start_idx} ####")
-            infer_maml_map(
+            infer_maml_map_simplified(
                 curr_test_loader,
                 curr_support_loader,
                 encoder,
@@ -1662,7 +1881,8 @@ def infer_helper(
                 model_utils,
                 epoch,
                 test_loader_len,
-                support_loader_len,
+                encoder_learning_rules = None, 
+                decoder_learning_rules = None,
             )
         else:
             print(f"#### LSTM+map inference at index {start_idx} ####")
@@ -1902,7 +2122,6 @@ def main():
                     # If val loss increased 3 times consecutively, go to next rollout length
                     if decrement_counter > 2 or (epoch % 100 == 0 and epoch > 0):
                         break
-        #import pdb; pdb.set_trace();
 
     else:
 
@@ -1910,6 +2129,7 @@ def main():
 
         temp_save_dir = tempfile.mkdtemp()
 
+        #import pdb; pdb.set_trace();
         test_size = data_dict["test_input"].shape[0]
         test_data_subsets = baseline_utils.get_test_data_dict_subset(
             data_dict, args)

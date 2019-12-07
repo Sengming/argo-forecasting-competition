@@ -652,6 +652,7 @@ def lstm_forward(
     pred_len: int,
     criterion: Any,
     model_utils: ModelUtils,
+    use_tf = False,
 ):
     batch_size =  input_seq.shape[0]
     # Initialize losses
@@ -687,7 +688,9 @@ def lstm_forward(
         loss += criterion(decoder_output[:, :2], target_seq[:, di, :2])
 
         # Use own predictions as inputs at next step
-        decoder_input = decoder_output
+        #decoder_input = decoder_output
+        # For teacher forcing, feed in the actual output instead of the 
+        decoder_input = decoder_output if not use_tf else target_seq[:, di, :2])
 
     # Get average loss for pred_len
     loss = loss / pred_len
@@ -920,7 +923,8 @@ def maml_infer_forward(
             args.obs_len,
             rollout_len,
             criterion,
-            model_utils
+            model_utils,
+            False,
         )
 
         encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
@@ -949,6 +953,7 @@ def maml_forward(
         rollout_len: int = 30,
         encoder_learning_rule = None,
         decoder_learning_rule = None,
+        use_tf = False,
 ):
 
     #import pdb; pdb.set_trace();
@@ -983,7 +988,8 @@ def maml_forward(
             args.obs_len,
             rollout_len,
             criterion,
-            model_utils
+            model_utils,
+            use_tf,
         )
 
         total_losses.append(per_step_loss_importance_vecor[iter_] * support_loss)
@@ -1009,7 +1015,8 @@ def maml_forward(
         args.obs_len,
         rollout_len,
         criterion,
-        model_utils
+        model_utils.
+        use_tf,
     ) 
     total_losses.append(train_loss)
 
@@ -1079,6 +1086,7 @@ def train_maml_oversimplified(
                 rollout_len,
                 encoder_learning_rule,
                 decoder_learning_rule,
+                args.use_tf,
             )
             encoder_optimizer.zero_grad()
             decoder_optimizer.zero_grad()
@@ -1172,14 +1180,7 @@ def validate_maml(
                 rollout_len = rollout_len,
                 encoder_learning_rule = encoder_learning_rule,
                 decoder_learning_rule = decoder_learning_rule,
-            )
-
-            total_loss.append(loss.detach().item())
-
-            if i % 10 == 0:
-
-                pbar.write(
-                    f"Val -- Epoch:{epoch}, loss:{loss.detach().item()}, Rollout: {rollout_len}",
+                False,
                 )
 
     # Save

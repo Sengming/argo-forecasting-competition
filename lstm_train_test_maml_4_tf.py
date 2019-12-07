@@ -143,6 +143,9 @@ def parse_arguments() -> Any:
     parser.add_argument("--maml",
                         action="store_true",
                         help="Use Meta Learning")
+    parser.add_argument("--use_tf",
+                        action="store_true",
+                        help="Use teacher forcing")
     parser.add_argument("--per_step_maml_optimization",
                         action="store_true",
                         help="Use MAML++")

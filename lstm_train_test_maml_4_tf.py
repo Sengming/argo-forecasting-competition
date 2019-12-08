@@ -693,7 +693,7 @@ def lstm_forward(
         # Use own predictions as inputs at next step
         #decoder_input = decoder_output
         # For teacher forcing, feed in the actual output instead of the 
-        decoder_input = decoder_output if not use_tf else target_seq[:, di, :2])
+        decoder_input = decoder_output if not use_tf else target_seq[:, di, :2]
 
     # Get average loss for pred_len
     loss = loss / pred_len
@@ -1183,7 +1183,7 @@ def validate_maml(
                 rollout_len = rollout_len,
                 encoder_learning_rule = encoder_learning_rule,
                 decoder_learning_rule = decoder_learning_rule,
-                False,
+                use_tf=False,
                 )
 
     # Save

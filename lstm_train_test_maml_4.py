@@ -47,7 +47,7 @@ global_step = 0
 best_loss = float("inf")
 np.random.seed(100)
 
-ROLLOUT_LENS = [30]
+ROLLOUT_LENS = [1, 10, 30]
 
 
 def parse_arguments() -> Any:
@@ -60,7 +60,7 @@ def parse_arguments() -> Any:
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_batch_size",
                         type=int,
-                        default=512,
+                        default=2048,
                         help="Test batch size")
     parser.add_argument("--model_path",
                         required=False,
@@ -1643,7 +1643,7 @@ def infer_maml_map_simplified(
                                                    decoder_learning_rules = decoder_learning_rules,
                                                  )
 
-        (_, _, _, _, helpers) = data_batch
+        (_, _, social_inputs, _, helpers) = data_batch
         batch_helpers = list(zip(*helpers))
 
         helpers_dict = {}
@@ -1673,7 +1673,8 @@ def infer_maml_map_simplified(
                     test_input_seq = torch.FloatTensor(
                                      np.expand_dims(curr_nt_dist[:args.obs_len].astype(float),
                                      0)).to(device)
-
+                    if args.use_social: 
+                    	test_input_seq = torch.cat((test_input_seq, social_inputs[batch_idx,:,:,2:].to(device)), dim=2)
                     test_target_seq = torch.zeros(test_input_seq.shape[0], 30, 2)
 
                     preds = lstm_infer_forward(
@@ -1913,8 +1914,8 @@ def main():
     """Main."""
     args = parse_arguments()
 
-    if not baseline_utils.validate_args(args):
-        return
+    #if not baseline_utils.validate_args(args):
+    #    return
 
     print(f"Using all ({joblib.cpu_count()}) CPUs....")
     if use_cuda:
@@ -2130,7 +2131,7 @@ def main():
                     )
 
                     # If val loss increased 3 times consecutively, go to next rollout length
-                    if decrement_counter > 2 or (epoch % 100 == 0 and epoch > 0):
+                    if decrement_counter > 3:
                         break
 
     else:
@@ -2151,7 +2152,7 @@ def main():
             data_dict, args)
         
         # test_batch_size should be lesser than joblib_batch_size
-        Parallel(n_jobs=12, verbose=2)(
+        Parallel(n_jobs=6, verbose=2)(
             delayed(infer_helper)(test_data_subsets[i], support_data_subsets[i], i, encoder, decoder,
                                   model_utils, temp_save_dir, epoch, encoder_learning_rule_and_dict, 
 				  decoder_learning_rule_and_dict)

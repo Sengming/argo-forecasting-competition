@@ -173,6 +173,9 @@ def parse_arguments() -> Any:
     parser.add_argument("--use_lslr",
                         action="store_true",
                         help="Use LSLR learning rule")
+    parser.add_argument("--use_attention",
+                        action="store_true",
+                        help="Use attention decoder")
     parser.add_argument("--use_learnable_lr",
                         action="store_true",
                         help="Use learnable LR during LSLR")
@@ -344,7 +347,9 @@ class MetaEncoderRNN(nn.Module):
             prev_key = 'lstm{}'.format(i)
             hidden_out[key] = self.enclstms[key](hidden_out[prev_key][0], hidden_in[key], (None if param == None else param_dict[key]))
 
-        return hidden_out
+        output = hidden_out['lstm{}'.format(self.num_layers)][0]
+        
+        return hidden_out, output
     
     def preprocess_param_dict(self, param_dict):
         reordered_dict = {}
@@ -433,6 +438,109 @@ class MetaDecoderRNN(nn.Module):
                 reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
             elif names_split[0] == 'declinear2':
                 reordered_dict['declinear2'][names_split[1]] = param
+        return reordered_dict
+
+class MetaAttDecoderRNN(nn.Module):
+    """Encoder Network."""
+    def __init__(self,
+                 embedding_size=8,
+                 hidden_size=16,
+                 output_size=2,
+                 num_layers = 1,
+                 obs_len= 20,
+                 ):
+
+        """Args:
+            embedding_size: Embedding size
+            hidden_size: Hidden size of LSTM
+            output_size: number of features in the output
+        """
+        super(MetaAttDecoderRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers 
+
+        self.declinear1 = MetaLinearLayer(output_size, embedding_size, use_bias=True)
+        #self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
+        self.declstms = nn.ModuleDict()
+        self.declstms['lstm1'] = MetaLSTMCell(embedding_size, hidden_size)
+
+        for i in range(1, self.num_layers):
+            self.declstms['lstm{}'.format(i+1)] = MetaLSTMCell(hidden_size, hidden_size)
+
+        self.declinear2 = MetaLinearLayer(hidden_size, output_size, use_bias=True)
+
+        self.attn = MetaLinearLayer(embedding_size + (hidden_size * num_layers), obs_len, use_bias=True) 
+        self.attn_combine = MetaLinearLayer(hidden_size + embedding_size , embedding_size, use_bias=True)
+
+    def forward(self, x: torch.FloatTensor, hidden_in, encoder_outputs, param=None):
+        """Run forward propagation.
+
+        Args:
+            x: input to the network
+            hidden: initial hidden state
+            param: meta params
+            encoder_outputs: all previous encoder output hidden states
+        Returns:
+            hidden: final hidden 
+
+        """
+        #import pdb; pdb.set_trace()
+        param_dict = None if param == None else self.preprocess_param_dict(param)
+        embedded = F.leaky_relu(self.declinear1(x, (None if param == None else param_dict['declinear1'])))
+
+        # Attention stuff:
+        attn_input = embedded
+        
+        #import pdb; pdb.set_trace()
+        for i in range(1, self.num_layers+1):
+            key = 'lstm{}'.format(i)
+            # We only want to concatenate hidden, not c
+            attn_input = torch.cat((attn_input, hidden_in[key][0]), dim=1)
+
+        attn_weights = torch.nn.functional.softmax(self.attn(attn_input, (None if param == None else param_dict['attn'])), dim=1)
+        attn_applied = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)
+
+        attn_combined_input = torch.cat((attn_applied.squeeze(1), embedded), dim=1) 
+        attn_combined_output = torch.nn.functional.relu(self.attn_combine(attn_combined_input, (None if param == None else param_dict['attn_combine'])))
+
+        # end of attention stuff
+        
+        #hidden = self.lstm1(embedded, hidden, (None if param == None else param_dict['lstm1']))
+        hidden_out = dict()
+        hidden_out['lstm1'] = self.declstms['lstm1'](attn_combined_output, hidden_in['lstm1'], (None if param == None else param_dict['lstm1']))
+        
+        for i in range(1, self.num_layers):
+            key = 'lstm{}'.format(i+1)
+            prev_key = 'lstm{}'.format(i)
+            hidden_out[key] = self.declstms[key](hidden_out[prev_key][0], hidden_in[key], (None if param == None else param_dict[key]))
+
+        output = self.declinear2(hidden_out['lstm{}'.format(self.num_layers)][0], (None if param == None else param_dict['declinear2']))
+        return output, hidden_out
+    
+    def preprocess_param_dict(self, param_dict):
+        reordered_dict = {}
+        reordered_dict['declinear1'] = {}
+        reordered_dict['declinear2'] = {}
+        reordered_dict['attn'] = {}
+        reordered_dict['attn_combine'] = {}
+        for i in range(1, self.num_layers+1):
+            reordered_dict['lstm{}'.format(i)] = {}
+            reordered_dict['lstm{}'.format(i)]['i2h'] ={}
+            reordered_dict['lstm{}'.format(i)]['h2h'] ={}
+        for name, param in param_dict.items():
+            key = (name.replace('module.', '')) if 'module.' in name else name
+            names_split = key.split('.')
+            if names_split[0] == 'declinear1':
+                reordered_dict['declinear1'][names_split[1]] = param
+            elif names_split[0] == 'declstms':
+                reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
+            elif names_split[0] == 'declinear2':
+                reordered_dict['declinear2'][names_split[1]] = param
+            elif names_split[0] == 'attn':
+                reordered_dict['attn'][names_split[1]] = param
+            elif names_split[0] == 'attn_combine':
+                reordered_dict['attn_combine'][names_split[1]] = param
+
         return reordered_dict
 
 class EncoderRNN(nn.Module):
@@ -652,6 +760,7 @@ def lstm_forward(
     pred_len: int,
     criterion: Any,
     model_utils: ModelUtils,
+    use_attention: bool,
 ):
     batch_size =  input_seq.shape[0]
     # Initialize losses
@@ -661,13 +770,17 @@ def lstm_forward(
                                         batch_size,
                                         encoder.module.hidden_size if use_cuda else encoder.hidden_size,
                                         model_utils,)
+    if use_attention:
+        # For attention
+        # Output from encoder is batch_size x hidden_size
+        encoder_outputs = torch.zeros(batch_size, obs_len, encoder.module.hidden_size if use_cuda else encoder.hidden_size, device=device)
 
-
-    #import pdb; pdb.set_trace()
     # Encode observed trajectory
     for ei in range(obs_len):
         encoder_input = input_seq[:, ei, :]
-        encoder_hidden = encoder(encoder_input, encoder_hidden, encoder_params)
+        encoder_hidden, encoder_out = encoder(encoder_input, encoder_hidden, encoder_params)
+        if use_attention:
+            encoder_outputs[:,ei,:] = encoder_out
 
     # Initialize decoder input with last coordinate in encoder
     decoder_input = encoder_input[:, :2]
@@ -679,7 +792,11 @@ def lstm_forward(
 
     # Decode hidden state in future trajectory
     for di in range(pred_len):
-        decoder_output, decoder_hidden = decoder(decoder_input,
+        if use_attention:
+            decoder_output, decoder_hidden = decoder(decoder_input,
+                                                 decoder_hidden, encoder_outputs, decoder_params)
+        else:
+            decoder_output, decoder_hidden = decoder(decoder_input,
                                                  decoder_hidden, decoder_params)
         decoder_outputs[:, di, :] = decoder_output
 
@@ -719,7 +836,7 @@ def lstm_infer_forward(
     # Encode observed trajectory
     for ei in range(obs_len):
         encoder_input = input_seq[:, ei, :]
-        encoder_hidden = encoder(encoder_input, encoder_hidden, encoder_params)
+        encoder_hidden, encoder_out = encoder(encoder_input, encoder_hidden, encoder_params)
 
     # Initialize decoder input with last coordinate in encoder
     decoder_input = encoder_input[:, :2]
@@ -920,7 +1037,8 @@ def maml_infer_forward(
             args.obs_len,
             rollout_len,
             criterion,
-            model_utils
+            model_utils,
+            args.use_attention,
         )
 
         encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
@@ -983,7 +1101,8 @@ def maml_forward(
             args.obs_len,
             rollout_len,
             criterion,
-            model_utils
+            model_utils,
+            args.use_attention
         )
 
         total_losses.append(per_step_loss_importance_vecor[iter_] * support_loss)
@@ -1009,7 +1128,8 @@ def maml_forward(
         args.obs_len,
         rollout_len,
         criterion,
-        model_utils
+        model_utils,
+        args.use_attention,
     ) 
     total_losses.append(train_loss)
 
@@ -1474,6 +1594,124 @@ def infer_absolute(
               "wb") as f:
         pkl.dump(forecasted_trajectories, f)
 
+def infer_maml_abs_simplified(
+        test_loader: Any,
+        support_loader: Any,
+        encoder: Any,
+        decoder: Any,
+        start_idx: int,
+        forecasted_save_dir: str,
+        model_utils: ModelUtils,
+        epoch: int,
+        loader_len : int,
+        encoder_learning_rules = None, 
+        decoder_learning_rules = None,
+
+):
+    """Infer function for map-based LSTM baselines and save the forecasted trajectories.
+
+    Args:
+        test_loader: DataLoader for the test set
+        encoder: Encoder network instance
+        decoder: Decoder network instance
+        start_idx: start index for the current joblib batch
+        forecasted_save_dir: Directory where forecasted trajectories are to be saved
+        model_utils: ModelUtils instance
+        epoch: Epoch at which we ended training at
+    """
+    
+    forecasted_trajectories = {}
+    args = parse_arguments()
+    criterion = nn.MSELoss()
+    total_loss = []
+
+    for i, (support_batch, data_batch) in enumerate(zip(support_loader, test_loader)):
+
+        encoder.eval()
+        decoder.eval()
+
+        #import pdb; pdb.set_trace()
+        encoder_parameters, decoder_parameters = maml_infer_forward(
+                                                   args = args,
+                                                   data_batch = support_batch,
+                                                   epoch = epoch,
+                                                   criterion = criterion,
+                                                   encoder = encoder,
+                                                   decoder = decoder,
+                                                   model_utils = model_utils,
+                                                   encoder_learning_rules = encoder_learning_rules,
+                                                   decoder_learning_rules = decoder_learning_rules,
+                                                 )
+
+        (_, _, _, _, helpers) = data_batch
+        batch_helpers = list(zip(*helpers))
+
+        helpers_dict = {}
+        for k, v in config.LSTM_HELPER_DICT_IDX.items():
+            helpers_dict[k] = batch_helpers[v]
+    
+        batch_size = data_batch[2].shape[0]
+       
+        with tqdm(total=batch_size, desc='Iterating over batch', position=1) as pbar2:
+            for batch_idx in range(batch_size):
+                pbar2.update(1)
+
+                num_candidates = len(helpers_dict["CANDIDATE_CENTERLINES"][batch_idx])
+                curr_centroids = helpers_dict["CENTROIDS"][batch_idx]
+                seq_id = int(helpers_dict["SEQ_PATHS"][batch_idx])
+                abs_outputs = []
+
+                # Predict using every centerline candidate for the current trajectory
+                for candidate_idx in range(num_candidates):
+                    curr_centerline = helpers_dict["CANDIDATE_CENTERLINES"][
+                        batch_idx][candidate_idx]
+                    curr_nt_dist = helpers_dict["CANDIDATE_NT_DISTANCES"][
+                        batch_idx][candidate_idx]
+
+                    # Since this is test set all our inputs are gonna be None, gotta build
+                    # them ourselves.
+                    test_input_seq = torch.FloatTensor(
+                                     np.expand_dims(curr_nt_dist[:args.obs_len].astype(float),
+                                     0)).to(device)
+
+                    test_target_seq = torch.zeros(test_input_seq.shape[0], 30, 2)
+
+                    preds = lstm_infer_forward(
+                              num_layers = args.num_layers,
+                              encoder = encoder,
+                              decoder = decoder,
+                              encoder_params = encoder_parameters,
+                              decoder_params = decoder_parameters,
+                              input_seq = test_input_seq,
+                              target_seq = test_target_seq,
+                              obs_len = args.obs_len,
+                              pred_len = args.pred_len,
+                              model_utils = model_utils,
+                            )
+
+                    abs_helpers = {}
+                    abs_helpers["REFERENCE"] = np.expand_dims(
+                        np.array(helpers_dict["CANDIDATE_DELTA_REFERENCES"]
+                                 [batch_idx][candidate_idx]),
+                        0,
+                    )
+                    abs_helpers["CENTERLINE"] = np.expand_dims(curr_centerline, 0)
+
+                    abs_input, abs_output = baseline_utils.get_abs_traj(
+                        test_input_seq.clone().cpu().numpy(),
+                        preds.detach().clone().cpu().numpy(),
+                        args,
+                        abs_helpers,
+                    )
+
+                    # array of shape (1,30,2) to list of (30,2)
+                    abs_outputs.append(abs_output[0])
+                forecasted_trajectories[seq_id] = abs_outputs
+    os.makedirs(forecasted_save_dir, exist_ok=True)
+    with open(os.path.join(forecasted_save_dir, f"{start_idx}.pkl"),
+              "wb") as f:
+        pkl.dump(forecasted_trajectories, f)
+
 def infer_maml_map(
         test_loader: Any,
         support_loader: Any,
@@ -1779,7 +2017,7 @@ def infer_map(
                 # Encode observed trajectory
                 for ei in range(input_length):
                     encoder_input = _input[:, ei, :]
-                    encoder_hidden = encoder(encoder_input, encoder_hidden)
+                    encoder_hidden, encoder_out = encoder(encoder_input, encoder_hidden)
 
                 # Initialize decoder input with last coordinate in encoder
                 decoder_input = encoder_input[:, :2]
@@ -1941,7 +2179,10 @@ def main():
     if args.maml:
         encoder = MetaEncoderRNN(
             input_size=len(baseline_utils.BASELINE_INPUT_FEATURES[baseline_key]), num_layers=args.num_layers)
-        decoder = MetaDecoderRNN(output_size=2, num_layers=args.num_layers)
+        if args.use_attention:
+            decoder = MetaAttDecoderRNN(output_size=2, num_layers=args.num_layers, obs_len = args.obs_len)
+        else:
+            decoder = MetaDecoderRNN(output_size=2, num_layers=args.num_layers)
     else:
         encoder = EncoderRNN(
             input_size=len(baseline_utils.BASELINE_INPUT_FEATURES[baseline_key]))

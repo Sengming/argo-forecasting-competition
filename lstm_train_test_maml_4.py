@@ -822,6 +822,7 @@ def lstm_infer_forward(
     obs_len: int,
     pred_len: int,
     model_utils: ModelUtils,
+    use_attention: bool,
 ):
     batch_size =  input_seq.shape[0]
     # Initialize losses
@@ -831,12 +832,18 @@ def lstm_infer_forward(
                                         encoder.module.hidden_size if use_cuda else encoder.hidden_size,
                                         model_utils,)
 
+    if use_attention:
+        # For attention
+        # Output from encoder is batch_size x hidden_size
+        encoder_outputs = torch.zeros(batch_size, obs_len, encoder.module.hidden_size if use_cuda else encoder.hidden_size, device=device)
 
     #import pdb; pdb.set_trace()
     # Encode observed trajectory
     for ei in range(obs_len):
         encoder_input = input_seq[:, ei, :]
         encoder_hidden, encoder_out = encoder(encoder_input, encoder_hidden, encoder_params)
+        if use_attention:
+            encoder_outputs[:,ei,:] = encoder_out
 
     # Initialize decoder input with last coordinate in encoder
     decoder_input = encoder_input[:, :2]
@@ -848,7 +855,11 @@ def lstm_infer_forward(
 
     # Decode hidden state in future trajectory
     for di in range(pred_len):
-        decoder_output, decoder_hidden = decoder(decoder_input,
+        if use_attention:
+            decoder_output, decoder_hidden = decoder(decoder_input,
+                                                 decoder_hidden, encoder_outputs, decoder_params)
+        else:
+            decoder_output, decoder_hidden = decoder(decoder_input,
                                                  decoder_hidden, decoder_params)
         decoder_outputs[:, di, :] = decoder_output
 
@@ -1038,7 +1049,7 @@ def maml_infer_forward(
             rollout_len,
             criterion,
             model_utils,
-            args.use_attention,
+            use_attention=args.use_attention,
         )
 
         encoder_copy_params, decoder_copy_params = maml_inner_loop_update(
@@ -1102,7 +1113,7 @@ def maml_forward(
             rollout_len,
             criterion,
             model_utils,
-            args.use_attention
+            use_attention=args.use_attention
         )
 
         total_losses.append(per_step_loss_importance_vecor[iter_] * support_loss)
@@ -1687,6 +1698,7 @@ def infer_maml_abs_simplified(
                               obs_len = args.obs_len,
                               pred_len = args.pred_len,
                               model_utils = model_utils,
+                              use_attention=args.use_attention,
                             )
 
                     abs_helpers = {}
@@ -1926,6 +1938,7 @@ def infer_maml_map_simplified(
                               obs_len = args.obs_len,
                               pred_len = args.pred_len,
                               model_utils = model_utils,
+                              use_attention=args.use_attention,
                             )
 
                     abs_helpers = {}
@@ -2214,7 +2227,7 @@ def main():
             args.model_path, encoder, decoder, encoder_optimizer,
             decoder_optimizer)
         start_epoch = epoch + 1
-        start_rollout_idx = ROLLOUT_LENS.index(rollout_len) + 1
+        start_rollout_idx = ROLLOUT_LENS.index(rollout_len)
 
     else:
         start_epoch = 0

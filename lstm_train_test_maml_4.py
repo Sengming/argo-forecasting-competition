@@ -299,8 +299,8 @@ class MetaEncoderRNN(nn.Module):
     """Encoder Network."""
     def __init__(self,
                  input_size: int = 2,
-                 embedding_size: int = 8,
-                 hidden_size: int = 16,
+                 embedding_size: int = 32,
+                 hidden_size: int = 128,
                  num_layers: int = 1
                  ):
         """Initialize the encoder network.
@@ -316,6 +316,9 @@ class MetaEncoderRNN(nn.Module):
         self.num_layers = num_layers
         
         self.enclinear1 = MetaLinearLayer(input_size, embedding_size, use_bias=True)
+        self.enclinear2 = MetaLinearLayer(embedding_size, hidden_size, use_bias=True)
+        self.enclinear3 = MetaLinearLayer(hidden_size, embedding_size, use_bias=True)
+        
         self.enclstms = nn.ModuleDict()
         self.enclstms['lstm1'] = MetaLSTMCell(embedding_size, hidden_size)
 
@@ -337,7 +340,10 @@ class MetaEncoderRNN(nn.Module):
         param_dict = None if param == None else self.preprocess_param_dict(param)
         #embedded = F.relu(self.enclinear1(x, (None if param == None else param_dict['enclinear1'])))
         #hidden = self.lstm['lstm1'](embedded, hidden, (None if param == None else param_dict['lstm1']))
-        embedded = F.leaky_relu(self.enclinear1(x, (None if param == None else param_dict['enclinear1'])))
+        embedded = F.leaky_relu(self.enclinear3(self.enclinear2(self.enclinear1(x,
+                                (None if param == None else param_dict['enclinear1'])),
+                                (None if param == None else param_dict['enclinear2'])),
+                                (None if param == None else param_dict['enclinear3'])))
         hidden_out = dict()
         #import pdb; pdb.set_trace();
         hidden_out['lstm1'] = self.enclstms['lstm1'](embedded, hidden_in['lstm1'], (None if param == None else param_dict['lstm1']))
@@ -354,6 +360,8 @@ class MetaEncoderRNN(nn.Module):
     def preprocess_param_dict(self, param_dict):
         reordered_dict = {}
         reordered_dict['enclinear1'] = {}
+        reordered_dict['enclinear2'] = {}
+        reordered_dict['enclinear3'] = {}
         for i in range(1, self.num_layers+1):
             reordered_dict['lstm{}'.format(i)] = {}
             reordered_dict['lstm{}'.format(i)]['i2h'] ={}
@@ -363,6 +371,10 @@ class MetaEncoderRNN(nn.Module):
             names_split = key.split('.')
             if names_split[0] == 'enclinear1':
                 reordered_dict['enclinear1'][names_split[1]] = param
+            elif names_split[0] == 'enclinear2':
+                reordered_dict['enclinear2'][names_split[1]] = param
+            elif names_split[0] == 'enclinear3':
+                reordered_dict['enclinear3'][names_split[1]] = param
             elif names_split[0] == 'enclstms':
                 reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
         return reordered_dict
@@ -370,8 +382,8 @@ class MetaEncoderRNN(nn.Module):
 class MetaDecoderRNN(nn.Module):
     """Encoder Network."""
     def __init__(self,
-                 embedding_size=8,
-                 hidden_size=16,
+                 embedding_size=32,
+                 hidden_size=128,
                  output_size=2,
                  num_layers = 1,
                  ):
@@ -386,6 +398,8 @@ class MetaDecoderRNN(nn.Module):
         self.num_layers = num_layers 
 
         self.declinear1 = MetaLinearLayer(output_size, embedding_size, use_bias=True)
+        self.declinear2 = MetaLinearLayer(embedding_size, hidden_size, use_bias=True)
+        self.declinear3 = MetaLinearLayer(hidden_size, embedding_size, use_bias=True)
         #self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
         self.declstms = nn.ModuleDict()
         self.declstms['lstm1'] = MetaLSTMCell(embedding_size, hidden_size)
@@ -393,7 +407,7 @@ class MetaDecoderRNN(nn.Module):
         for i in range(1, self.num_layers):
             self.declstms['lstm{}'.format(i+1)] = MetaLSTMCell(hidden_size, hidden_size)
 
-        self.declinear2 = MetaLinearLayer(hidden_size, output_size, use_bias=True)
+        self.declinear_out = MetaLinearLayer(hidden_size, output_size, use_bias=True)
 
     def forward(self, x: torch.FloatTensor, hidden_in, param=None):
         """Run forward propagation.
@@ -407,7 +421,10 @@ class MetaDecoderRNN(nn.Module):
         """
         #import pdb; pdb.set_trace()
         param_dict = None if param == None else self.preprocess_param_dict(param)
-        embedded = F.leaky_relu(self.declinear1(x, (None if param == None else param_dict['declinear1'])))
+        embedded = F.leaky_relu(self.declinear3(self.declinear2(self.declinear1(x,
+                                (None if param == None else param_dict['declinear1'])),
+                                (None if param == None else param_dict['declinear2'])),
+                                (None if param == None else param_dict['declinear3'])))
 
         #hidden = self.lstm1(embedded, hidden, (None if param == None else param_dict['lstm1']))
         hidden_out = dict()
@@ -418,13 +435,15 @@ class MetaDecoderRNN(nn.Module):
             prev_key = 'lstm{}'.format(i)
             hidden_out[key] = self.declstms[key](hidden_out[prev_key][0], hidden_in[key], (None if param == None else param_dict[key]))
 
-        output = self.declinear2(hidden_out['lstm{}'.format(self.num_layers)][0], (None if param == None else param_dict['declinear2']))
+        output = self.declinear_out(hidden_out['lstm{}'.format(self.num_layers)][0], (None if param == None else param_dict['declinear_out']))
         return output, hidden_out
     
     def preprocess_param_dict(self, param_dict):
         reordered_dict = {}
         reordered_dict['declinear1'] = {}
         reordered_dict['declinear2'] = {}
+        reordered_dict['declinear3'] = {}
+        reordered_dict['declinear_out'] = {}
         for i in range(1, self.num_layers+1):
             reordered_dict['lstm{}'.format(i)] = {}
             reordered_dict['lstm{}'.format(i)]['i2h'] ={}
@@ -434,17 +453,21 @@ class MetaDecoderRNN(nn.Module):
             names_split = key.split('.')
             if names_split[0] == 'declinear1':
                 reordered_dict['declinear1'][names_split[1]] = param
-            elif names_split[0] == 'declstms':
-                reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
             elif names_split[0] == 'declinear2':
                 reordered_dict['declinear2'][names_split[1]] = param
+            elif names_split[0] == 'declinear3':
+                reordered_dict['declinear3'][names_split[1]] = param
+            elif names_split[0] == 'declstms':
+                reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
+            elif names_split[0] == 'declinear_out':
+                reordered_dict['declinear_out'][names_split[1]] = param
         return reordered_dict
 
 class MetaAttDecoderRNN(nn.Module):
     """Encoder Network."""
     def __init__(self,
-                 embedding_size=8,
-                 hidden_size=16,
+                 embedding_size=32,
+                 hidden_size=128,
                  output_size=2,
                  num_layers = 1,
                  obs_len= 20,
@@ -460,6 +483,8 @@ class MetaAttDecoderRNN(nn.Module):
         self.num_layers = num_layers 
 
         self.declinear1 = MetaLinearLayer(output_size, embedding_size, use_bias=True)
+        self.declinear2 = MetaLinearLayer(embedding_size, hidden_size, use_bias=True)
+        self.declinear3 = MetaLinearLayer(hidden_size, embedding_size, use_bias=True)
         #self.lstm1 = MetaLSTMCell(embedding_size, hidden_size)
         self.declstms = nn.ModuleDict()
         self.declstms['lstm1'] = MetaLSTMCell(embedding_size, hidden_size)
@@ -467,7 +492,7 @@ class MetaAttDecoderRNN(nn.Module):
         for i in range(1, self.num_layers):
             self.declstms['lstm{}'.format(i+1)] = MetaLSTMCell(hidden_size, hidden_size)
 
-        self.declinear2 = MetaLinearLayer(hidden_size, output_size, use_bias=True)
+        self.declinear_out = MetaLinearLayer(hidden_size, output_size, use_bias=True)
 
         self.attn = MetaLinearLayer(embedding_size + (hidden_size * num_layers), obs_len, use_bias=True) 
         self.attn_combine = MetaLinearLayer(hidden_size + embedding_size , embedding_size, use_bias=True)
@@ -486,7 +511,10 @@ class MetaAttDecoderRNN(nn.Module):
         """
         #import pdb; pdb.set_trace()
         param_dict = None if param == None else self.preprocess_param_dict(param)
-        embedded = F.leaky_relu(self.declinear1(x, (None if param == None else param_dict['declinear1'])))
+        embedded = F.leaky_relu(self.declinear3(self.declinear2(self.declinear1(x,
+                                (None if param == None else param_dict['declinear1'])),
+                                (None if param == None else param_dict['declinear2'])),
+                                (None if param == None else param_dict['declinear3'])))
 
         # Attention stuff:
         attn_input = embedded
@@ -497,11 +525,11 @@ class MetaAttDecoderRNN(nn.Module):
             # We only want to concatenate hidden, not c
             attn_input = torch.cat((attn_input, hidden_in[key][0]), dim=1)
 
-        attn_weights = torch.nn.functional.softmax(self.attn(attn_input, (None if param == None else param_dict['attn'])), dim=1)
+        attn_weights = F.softmax(self.attn(attn_input, (None if param == None else param_dict['attn'])), dim=1)
         attn_applied = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)
 
         attn_combined_input = torch.cat((attn_applied.squeeze(1), embedded), dim=1) 
-        attn_combined_output = torch.nn.functional.relu(self.attn_combine(attn_combined_input, (None if param == None else param_dict['attn_combine'])))
+        attn_combined_output = F.leaky_relu(self.attn_combine(attn_combined_input, (None if param == None else param_dict['attn_combine'])))
 
         # end of attention stuff
         
@@ -514,13 +542,15 @@ class MetaAttDecoderRNN(nn.Module):
             prev_key = 'lstm{}'.format(i)
             hidden_out[key] = self.declstms[key](hidden_out[prev_key][0], hidden_in[key], (None if param == None else param_dict[key]))
 
-        output = self.declinear2(hidden_out['lstm{}'.format(self.num_layers)][0], (None if param == None else param_dict['declinear2']))
+        output = self.declinear_out(hidden_out['lstm{}'.format(self.num_layers)][0], (None if param == None else param_dict['declinear_out']))
         return output, hidden_out
     
     def preprocess_param_dict(self, param_dict):
         reordered_dict = {}
         reordered_dict['declinear1'] = {}
         reordered_dict['declinear2'] = {}
+        reordered_dict['declinear3'] = {}
+        reordered_dict['declinear_out'] = {}
         reordered_dict['attn'] = {}
         reordered_dict['attn_combine'] = {}
         for i in range(1, self.num_layers+1):
@@ -532,10 +562,14 @@ class MetaAttDecoderRNN(nn.Module):
             names_split = key.split('.')
             if names_split[0] == 'declinear1':
                 reordered_dict['declinear1'][names_split[1]] = param
-            elif names_split[0] == 'declstms':
-                reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
             elif names_split[0] == 'declinear2':
                 reordered_dict['declinear2'][names_split[1]] = param
+            elif names_split[0] == 'declinear3':
+                reordered_dict['declinear3'][names_split[1]] = param
+            elif names_split[0] == 'declstms':
+                reordered_dict[names_split[1]][names_split[2]][names_split[3]] = param
+            elif names_split[0] == 'declinear_out':
+                reordered_dict['declinear_out'][names_split[1]] = param
             elif names_split[0] == 'attn':
                 reordered_dict['attn'][names_split[1]] = param
             elif names_split[0] == 'attn_combine':
